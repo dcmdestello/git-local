@@ -7,6 +7,8 @@ init() {
     GIT_DIR=$(git rev-parse --git-dir 2>/dev/null) || die "not in a git repository"
     REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || die "cannot find repo root"
     MARKS_FILE="$GIT_DIR/local-marks"
+    PID_FILE="$GIT_DIR/git-local.pid"
+    LOG_FILE="$GIT_DIR/git-local.log"
 }
 
 # Resolve a path (relative to cwd or absolute) to repo-root-relative
@@ -41,11 +43,81 @@ stored_hash_for() {
     done < "$MARKS_FILE"
 }
 
+# Check if watcher daemon is running
+is_running() {
+    [[ -f "$PID_FILE" ]] || return 1
+    local pid
+    pid=$(cat "$PID_FILE")
+    if kill -0 "$pid" 2>/dev/null; then
+        return 0
+    else
+        rm "$PID_FILE" # Stale PID file
+        return 1
+    fi
+}
+
+# ── daemon management ────────────────────────────────────────────────────────
+
+cmd_watch() {
+    init
+    if is_running; then
+        printf 'Watcher already running (PID %s)\n' "$(cat "$PID_FILE")"
+        return 0
+    fi
+    
+    # Check for fswatch and warn if missing
+    if ! command -v fswatch >/dev/null 2>&1; then
+        printf '\033[33mWarning: fswatch not found.\033[0m\n'
+        printf 'Watcher will run in polling mode (every 3s).\n'
+        printf 'Install fswatch for instant updates: \033[1mbrew install fswatch\033[0m\n\n'
+    fi
+    
+    # Start watcher in background
+    # We call "$0" loop to run the actual watch loop
+    nohup "$0" loop > "$LOG_FILE" 2>&1 &
+    echo $! > "$PID_FILE"
+    # disown not strictly needed with nohup but good practice in some shells
+    disown $! 2>/dev/null || true
+    
+    printf 'Started background watcher (PID %s)\n' "$(cat "$PID_FILE")"
+    printf 'Logs at: %s\n' "$LOG_FILE"
+    printf 'Run "git local stop" to stop it.\n'
+}
+
+cmd_stop() {
+    init
+    if is_running; then
+        local pid
+        pid=$(cat "$PID_FILE")
+        kill "$pid" 2>/dev/null || true
+        rm "$PID_FILE"
+        printf 'Stopped watcher (PID %s)\n' "$pid"
+    else
+        printf 'Watcher is not running.\n'
+    fi
+}
+
+cmd_restart() {
+    cmd_stop
+    cmd_watch
+}
+
 # ── mark ─────────────────────────────────────────────────────────────────────
 
 cmd_mark() {
-    [[ $# -eq 0 ]] && die "usage: git local mark <pathspec>... (e.g. . or *)"
     init
+    if [[ $# -eq 0 ]]; then
+        cmd_interactive
+        # Check if we should auto-start/restart watcher after interactive session
+        if [[ -s "$MARKS_FILE" ]]; then
+            if is_running; then
+                cmd_restart
+            else
+                cmd_watch
+            fi
+        fi
+        return
+    fi
 
     # Capture files into an array using -z for safety with spaces/special chars
     local files=()
@@ -75,6 +147,172 @@ cmd_mark() {
         git update-index --skip-worktree -- "$rel"
 
         printf 'marked: %s (%s)\n' "$rel" "${hash:0:8}"
+    done
+    
+    # Restart watcher to pick up new files (or start if not running)
+    if is_running; then
+        cmd_restart >/dev/null 2>&1
+    else
+        cmd_watch
+    fi
+}
+
+# ── interactive ──────────────────────────────────────────────────────────────
+
+cmd_interactive() {
+    # Gather candidates:
+    # 1. Currently marked files
+    # 2. Modified files (unstaged changes)
+    
+    local candidates=()
+    local display_names=()
+    local selected=()
+    local is_marked=()
+
+    # Read marked files
+    if [[ -f "$MARKS_FILE" ]]; then
+        while IFS=' ' read -r _ path || [[ -n "$path" ]]; do
+            [[ -z "$path" ]] && continue
+            # Avoid duplicates if file is both marked AND modified (can happen if revealed)
+            local exists=false
+            if [[ ${#candidates[@]} -gt 0 ]]; then
+                for c in "${candidates[@]}"; do [[ "$c" == "$path" ]] && exists=true; done
+            fi
+            if ! $exists; then
+                candidates+=("$path")
+                display_names+=("$path (marked)")
+                selected+=(true)
+                is_marked+=(true)
+            fi
+        done < "$MARKS_FILE"
+    fi
+
+    # Read modified files
+    while IFS= read -r -d '' path; do
+        # Normalize relative to repo root
+        # git diff --relative returns path relative to CWD. Need full repo path.
+        # But wait, we want to show path relative to repo root usually.
+        # Let's assume run from root for simplicity, or fix paths.
+        
+        # Actually, let's just use git diff --name-only (no --relative) from root
+        # to get consistent paths matching our marks file.
+        local exists=false
+        if [[ ${#candidates[@]} -gt 0 ]]; then
+            for c in "${candidates[@]}"; do [[ "$c" == "$path" ]] && exists=true; done
+        fi
+        if ! $exists; then
+            candidates+=("$path")
+            display_names+=("$path (modified)")
+            selected+=(false)
+            is_marked+=(false)
+        fi
+    done < <(git diff -z --name-only "$REPO_ROOT")
+
+    if [[ ${#candidates[@]} -eq 0 ]]; then
+        echo "No modified or marked files found."
+        return 0
+    fi
+
+    # Sort candidates? Ideally yes, but let's keep it simple.
+
+    local current=0
+    local total=${#candidates[@]}
+
+    # TUI Loop
+    # Hide cursor
+    printf '\033[?25l'
+    trap "printf '\033[?25h'" EXIT
+
+    while true; do
+        # Clear screen/move to top (simplified: just clear and reprint)
+        # Better: Save cursor, print, restore.
+        # Or just clear screen on each frame if list fits.
+        printf '\033[2J\033[H' # Clear screen and home
+        
+        echo "Select files to MARK (hide changes):"
+        echo "  [Space] toggle, [Enter] confirm, [q] cancel"
+        echo "  [w/s] or [Up/Down] to move"
+        echo ""
+
+        for ((i=0; i<total; i++)); do
+            local cursor=" "
+            if [[ $i -eq $current ]]; then cursor=">"; fi
+            
+            local box="[ ]"
+            if ${selected[$i]}; then box="[x]"; fi
+            
+            # Highlight current line
+            if [[ $i -eq $current ]]; then
+                printf "%s \033[7m%s %s\033[0m\n" "$cursor" "$box" "${display_names[$i]}"
+            else
+                printf "%s %s %s\n" "$cursor" "$box" "${display_names[$i]}"
+            fi
+        done
+
+        # Read input (1 char)
+        local key
+        IFS= read -rsn1 key
+
+        case "$key" in
+            "") # Enter
+                break
+                ;;
+            "q")
+                return 0
+                ;;
+            " ") # Space
+                if ${selected[$current]}; then
+                    selected[$current]=false
+                else
+                    selected[$current]=true
+                fi
+                ;;
+            "s") # Down
+                ((current++)) || true
+                [[ $current -ge $total ]] && current=0
+                ;;
+            "w") # Up
+                ((current--)) || true
+                [[ $current -lt 0 ]] && current=$((total-1))
+                ;;
+            $'\x1b') # Escape sequence
+                read -rsn2 -t 1 key # read next 2 chars (1s timeout for macOS bash 3.2)
+                case "$key" in
+                    "[A") # Up
+                        ((current--)) || true
+                        [[ $current -lt 0 ]] && current=$((total-1))
+                        ;;
+                    "[B") # Down
+                        ((current++)) || true
+                        [[ $current -ge $total ]] && current=0
+                        ;;
+                esac
+                ;;
+        esac
+    done
+
+    # Apply changes
+    printf '\nApplying changes...\n'
+    
+    for ((i=0; i<total; i++)); do
+        local path="${candidates[$i]}"
+        local was_marked="${is_marked[$i]}"
+        local is_selected="${selected[$i]}"
+
+        if $is_selected && ! $was_marked; then
+            # Mark it
+            local hash
+            hash=$(git hash-object "$REPO_ROOT/$path")
+            drop_entry "$path"
+            printf '%s %s\n' "$hash" "$path" >> "$MARKS_FILE"
+            git update-index --skip-worktree -- "$path"
+            printf 'marked: %s\n' "$path"
+        elif ! $is_selected && $was_marked; then
+            # Unmark it
+            drop_entry "$path"
+            git update-index --no-skip-worktree -- "$path" 2>/dev/null || true
+            printf 'unmarked: %s\n' "$path"
+        fi
     done
 }
 
@@ -116,6 +354,13 @@ cmd_unmark() {
 
     if ! $found_any; then
          printf 'no marked files matched arguments\n'
+    fi
+    
+    # Restart watcher if marks remain (to update list), or stop if empty
+    if [[ -s "$MARKS_FILE" ]]; then
+        if is_running; then cmd_restart >/dev/null 2>&1; fi
+    else
+        if is_running; then cmd_stop; fi
     fi
 }
 
@@ -183,6 +428,18 @@ cmd_sync() {
 
 cmd_status() {
     init
+    
+    # Show daemon status
+    if is_running; then
+        printf 'Watcher: \033[32mRUNNING\033[0m (PID %s)\n' "$(cat "$PID_FILE")"
+    else
+        printf 'Watcher: \033[31mSTOPPED\033[0m\n'
+        if [[ -f "$MARKS_FILE" && -s "$MARKS_FILE" ]]; then
+             printf '(Run "git local watch" to enable auto-sync)\n'
+        fi
+    fi
+    echo ""
+
     [[ -f "$MARKS_FILE" && -s "$MARKS_FILE" ]] || { echo "no files marked"; return 0; }
 
     printf '%-45s  %-8s  %s\n' "FILE" "STATE" "HASH"
@@ -209,18 +466,47 @@ cmd_status() {
     done < "$MARKS_FILE"
 }
 
-# ── watch ────────────────────────────────────────────────────────────────────
+# ── loop ─────────────────────────────────────────────────────────────────────
 
-cmd_watch() {
+cmd_loop() {
     init
-    local interval=3
-
-    printf 'watching every %ss — ctrl-c to stop\n' "$interval"
-
-    while true; do
-        sleep "$interval"
-        cmd_sync
-    done
+    
+    # Check for fswatch
+    if command -v fswatch >/dev/null 2>&1; then
+        printf 'Watching for changes with fswatch...\n'
+        
+        # Build list of specific files to watch
+        local watch_paths=()
+        if [[ -f "$MARKS_FILE" ]]; then
+            while IFS=' ' read -r _ path || [[ -n "$path" ]]; do
+                [[ -n "$path" ]] && watch_paths+=("$REPO_ROOT/$path")
+            done < "$MARKS_FILE"
+        fi
+        
+        if [[ ${#watch_paths[@]} -eq 0 ]]; then
+            printf 'No files to watch.\n'
+            # Loop forever doing nothing? Or exit?
+            # If we exit, the daemon dies.
+            # But unmark stops the daemon if empty.
+            # So this case should be rare.
+            sleep 3600
+        else
+            # Watch ONLY the marked files
+            # Optimization: latency 1s
+            fswatch -o -l 1 "${watch_paths[@]}" | while read -r _; do
+                cmd_sync # Run ONCE
+            done
+        fi
+    else
+        printf 'fswatch not found. Falling back to polling every 3s.\n'
+        printf '(Install fswatch for better performance: brew install fswatch)\n'
+        
+        local interval=3
+        while true; do
+            sleep "$interval"
+            cmd_sync
+        done
+    fi
 }
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -229,24 +515,33 @@ case "${1:-help}" in
     mark)   shift; cmd_mark "$@" ;;
     unmark) shift; cmd_unmark "$@" ;;
     sync)   cmd_sync ;;
-    status) cmd_status ;;
+    status|ls) cmd_status ;;
     watch)  shift; cmd_watch "$@" ;;
+    stop)   shift; cmd_stop "$@" ;;
+    restart) shift; cmd_restart "$@" ;;
+    loop)   shift; cmd_loop "$@" ;;
     help|-h|--help)
         cat <<'USAGE'
 usage: git local <command> [args]
 
 commands:
-  mark <file>...    Snapshot file content and hide from git status/diff
-  unmark <file>...  Stop tracking and reveal file to git
+  mark              Interactive mode: select files to hide/show
+  mark <spec>...    Mark matching modified files immediately
+  unmark <spec>...  Unmark matching files
   sync              Re-check marked files; reveal any with real changes
   status            List marked files and their current state
-  watch             Run sync in a loop (every 3s)
+  watch             Start background watcher (auto-starts on mark)
+  stop              Stop background watcher
+  restart           Restart background watcher
 
 Files are hidden via --skip-worktree as long as their content hash
 matches the snapshot taken at mark time. When the content diverges,
-'sync' (or 'watch') detects the mismatch and reveals the file to git.
+the watcher detects the mismatch and reveals the file to git.
 
 After committing real changes, re-run 'mark' to re-hide local edits.
+
+The watcher auto-starts when you mark files and auto-stops
+when all files are unmarked.
 USAGE
         ;;
     *)  die "unknown command: $1 (see 'git local help')" ;;
