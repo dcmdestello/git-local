@@ -1,0 +1,210 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+die() { printf 'git-debug: %s\n' "$*" >&2; exit 1; }
+
+init() {
+    GIT_DIR=$(git rev-parse --git-dir 2>/dev/null) || die "not in a git repository"
+    REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || die "cannot find repo root"
+    MARKS_FILE="$GIT_DIR/debug-marks"
+}
+
+# Resolve a path (relative to cwd or absolute) to repo-root-relative
+repo_relative() {
+    local abs
+    abs="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+    printf '%s' "${abs#"$REPO_ROOT"/}"
+}
+
+# Remove a path's entry from the marks file
+drop_entry() {
+    local target="$1"
+    [[ -f "$MARKS_FILE" ]] || return 0
+    local tmp="$MARKS_FILE.tmp"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" ]] && continue
+        [[ "${line#* }" != "$target" ]] && printf '%s\n' "$line"
+    done < "$MARKS_FILE" > "$tmp"
+    mv "$tmp" "$MARKS_FILE"
+}
+
+# Print the stored hash for a path (empty string if not found)
+stored_hash_for() {
+    local target="$1"
+    [[ -f "$MARKS_FILE" ]] || return 0
+    while IFS=' ' read -r hash path || [[ -n "$hash" ]]; do
+        [[ -z "$hash" ]] && continue
+        if [[ "$path" == "$target" ]]; then
+            printf '%s' "$hash"
+            return 0
+        fi
+    done < "$MARKS_FILE"
+}
+
+# ── mark ─────────────────────────────────────────────────────────────────────
+
+cmd_mark() {
+    [[ $# -eq 0 ]] && die "usage: git debug mark <file>..."
+    init
+
+    for file in "$@"; do
+        [[ -f "$file" ]] || die "not found: $file"
+
+        local rel
+        rel=$(repo_relative "$file")
+
+        git ls-files --error-unmatch -- "$rel" >/dev/null 2>&1 \
+            || die "not tracked: $rel"
+
+        local hash
+        hash=$(git hash-object "$REPO_ROOT/$rel")
+
+        drop_entry "$rel"
+        printf '%s %s\n' "$hash" "$rel" >> "$MARKS_FILE"
+        git update-index --skip-worktree -- "$rel"
+
+        printf 'marked: %s (%s)\n' "$rel" "${hash:0:8}"
+    done
+}
+
+# ── unmark ───────────────────────────────────────────────────────────────────
+
+cmd_unmark() {
+    [[ $# -eq 0 ]] && die "usage: git debug unmark <file>..."
+    init
+
+    for file in "$@"; do
+        local rel
+        rel=$(repo_relative "$file")
+
+        if [[ -n "$(stored_hash_for "$rel")" ]]; then
+            drop_entry "$rel"
+            git update-index --no-skip-worktree -- "$rel" 2>/dev/null || true
+            printf 'unmarked: %s\n' "$rel"
+        else
+            printf 'not marked: %s\n' "$rel"
+        fi
+    done
+}
+
+# ── sync ─────────────────────────────────────────────────────────────────────
+
+cmd_sync() {
+    init
+    [[ -f "$MARKS_FILE" && -s "$MARKS_FILE" ]] || return 0
+
+    local hashes=() paths=() dirty=false
+
+    while IFS=' ' read -r h p || [[ -n "$h" ]]; do
+        [[ -z "$h" ]] && continue
+        hashes+=("$h")
+        paths+=("$p")
+    done < "$MARKS_FILE"
+
+    for i in "${!paths[@]}"; do
+        local p="${paths[$i]}"
+        local stored="${hashes[$i]}"
+        local full="$REPO_ROOT/$p"
+
+        if [[ ! -f "$full" ]]; then
+            git update-index --no-skip-worktree -- "$p" 2>/dev/null || true
+            hashes[$i]=""
+            paths[$i]=""
+            dirty=true
+            printf 'removed: %s (file deleted)\n' "$p"
+            continue
+        fi
+
+        local current
+        current=$(git hash-object "$full")
+
+        if [[ "$current" == "$stored" ]]; then
+            git update-index --skip-worktree -- "$p" 2>/dev/null || true
+        else
+            git update-index --no-skip-worktree -- "$p" 2>/dev/null || true
+            printf 'revealed: %s (content changed)\n' "$p"
+        fi
+    done
+
+    if $dirty; then
+        local tmp="$MARKS_FILE.tmp"
+        : > "$tmp"
+        for i in "${!paths[@]}"; do
+            [[ -n "${paths[$i]}" ]] && printf '%s %s\n' "${hashes[$i]}" "${paths[$i]}"
+        done > "$tmp"
+        mv "$tmp" "$MARKS_FILE"
+    fi
+}
+
+# ── status ───────────────────────────────────────────────────────────────────
+
+cmd_status() {
+    init
+    [[ -f "$MARKS_FILE" && -s "$MARKS_FILE" ]] || { echo "no files marked"; return 0; }
+
+    printf '%-45s  %-8s  %s\n' "FILE" "STATE" "HASH"
+    printf '%-45s  %-8s  %s\n' "----" "-----" "----"
+
+    while IFS=' ' read -r stored_hash path || [[ -n "$stored_hash" ]]; do
+        [[ -z "$stored_hash" ]] && continue
+        local full="$REPO_ROOT/$path"
+        local state
+
+        if [[ ! -f "$full" ]]; then
+            state="deleted"
+        else
+            local current
+            current=$(git hash-object "$full")
+            if [[ "$current" == "$stored_hash" ]]; then
+                state="hidden"
+            else
+                state="changed"
+            fi
+        fi
+
+        printf '%-45s  %-8s  %s\n' "$path" "$state" "${stored_hash:0:8}"
+    done < "$MARKS_FILE"
+}
+
+# ── watch ────────────────────────────────────────────────────────────────────
+
+cmd_watch() {
+    init
+    local interval=3
+
+    printf 'watching every %ss — ctrl-c to stop\n' "$interval"
+
+    while true; do
+        sleep "$interval"
+        cmd_sync
+    done
+}
+
+# ── main ─────────────────────────────────────────────────────────────────────
+
+case "${1:-help}" in
+    mark)   shift; cmd_mark "$@" ;;
+    unmark) shift; cmd_unmark "$@" ;;
+    sync)   cmd_sync ;;
+    status) cmd_status ;;
+    watch)  shift; cmd_watch "$@" ;;
+    help|-h|--help)
+        cat <<'USAGE'
+usage: git debug <command> [args]
+
+commands:
+  mark <file>...    Snapshot file content and hide from git status/diff
+  unmark <file>...  Stop tracking and reveal file to git
+  sync              Re-check marked files; reveal any with real changes
+  status            List marked files and their current state
+  watch             Run sync in a loop (every 3s)
+
+Files are hidden via --skip-worktree as long as their content hash
+matches the snapshot taken at mark time. When the content diverges,
+'sync' (or 'watch') detects the mismatch and reveals the file to git.
+
+After committing real changes, re-run 'mark' to re-hide debug edits.
+USAGE
+        ;;
+    *)  die "unknown command: $1 (see 'git debug help')" ;;
+esac
