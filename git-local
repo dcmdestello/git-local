@@ -44,17 +44,28 @@ stored_hash_for() {
 # ── mark ─────────────────────────────────────────────────────────────────────
 
 cmd_mark() {
-    [[ $# -eq 0 ]] && die "usage: git local mark <file>..."
+    [[ $# -eq 0 ]] && die "usage: git local mark <pathspec>... (e.g. . or *)"
     init
 
-    for file in "$@"; do
-        [[ -f "$file" ]] || die "not found: $file"
+    # Capture files into an array using -z for safety with spaces/special chars
+    local files=()
+    while IFS= read -r -d '' file; do
+        files+=("$file")
+    done < <(git diff -z --name-only --relative -- "$@")
 
+    if [[ ${#files[@]} -eq 0 ]]; then
+        printf 'no modified files found matching arguments\n'
+        return 0
+    fi
+
+    for file in "${files[@]}"; do
+        # git diff output is relative to CWD (due to --relative), which repo_relative handles
         local rel
         rel=$(repo_relative "$file")
 
+        # Double check it's tracked (git diff usually implies it, but good to be safe)
         git ls-files --error-unmatch -- "$rel" >/dev/null 2>&1 \
-            || die "not tracked: $rel"
+            || { printf 'skipping untracked: %s\n' "$rel"; continue; }
 
         local hash
         hash=$(git hash-object "$REPO_ROOT/$rel")
@@ -70,21 +81,42 @@ cmd_mark() {
 # ── unmark ───────────────────────────────────────────────────────────────────
 
 cmd_unmark() {
-    [[ $# -eq 0 ]] && die "usage: git local unmark <file>..."
+    [[ $# -eq 0 ]] && die "usage: git local unmark <pathspec>... (e.g. . or *)"
     init
 
-    for file in "$@"; do
-        local rel
-        rel=$(repo_relative "$file")
+    # Read all currently marked files into an associative array for O(1) lookup
+    # (Using a simpler linear scan since bash <4 assoc arrays are tricky, and list is short)
+    local marks=()
+    while IFS=' ' read -r _ path || [[ -n "$path" ]]; do
+        [[ -n "$path" ]] && marks+=("$path")
+    done < "$MARKS_FILE"
 
-        if [[ -n "$(stored_hash_for "$rel")" ]]; then
-            drop_entry "$rel"
-            git update-index --no-skip-worktree -- "$rel" 2>/dev/null || true
-            printf 'unmarked: %s\n' "$rel"
-        else
-            printf 'not marked: %s\n' "$rel"
-        fi
-    done
+    [[ ${#marks[@]} -eq 0 ]] && { echo "no files currently marked"; return 0; }
+
+    # List files matching the user's pathspecs, then check if they are marked
+    local found_any=false
+    
+    while IFS= read -r -d '' cand; do
+        # git ls-files returns paths relative to CWD. Normalize to repo root relative.
+        # But repo_relative expects a file path relative to CWD or absolute.
+        # cand is relative to CWD, so repo_relative works fine.
+        local rel_cand
+        rel_cand=$(repo_relative "$cand")
+
+        for mark in "${marks[@]}"; do
+            if [[ "$rel_cand" == "$mark" ]]; then
+                drop_entry "$mark"
+                git update-index --no-skip-worktree -- "$mark" 2>/dev/null || true
+                printf 'unmarked: %s\n' "$mark"
+                found_any=true
+                break
+            fi
+        done
+    done < <(git ls-files -z -- "$@")
+
+    if ! $found_any; then
+         printf 'no marked files matched arguments\n'
+    fi
 }
 
 # ── sync ─────────────────────────────────────────────────────────────────────
@@ -115,14 +147,25 @@ cmd_sync() {
             continue
         fi
 
+        # Check current status: S=skip-worktree (hidden), anything else=visible
+        local status_char
+        status_char=$(git ls-files -v -- "$p" | cut -c1)
+
         local current
         current=$(git hash-object "$full")
 
         if [[ "$current" == "$stored" ]]; then
-            git update-index --skip-worktree -- "$p" 2>/dev/null || true
+            # Content matches stored hash -> Ensure hidden (S)
+            if [[ "$status_char" != "S" ]]; then
+                git update-index --skip-worktree -- "$p" 2>/dev/null || true
+                printf 'hidden: %s (content matches)\n' "$p"
+            fi
         else
-            git update-index --no-skip-worktree -- "$p" 2>/dev/null || true
-            printf 'revealed: %s (content changed)\n' "$p"
+            # Content differs -> Ensure visible (not S)
+            if [[ "$status_char" == "S" ]]; then
+                git update-index --no-skip-worktree -- "$p" 2>/dev/null || true
+                printf 'revealed: %s (content changed)\n' "$p"
+            fi
         fi
     done
 
