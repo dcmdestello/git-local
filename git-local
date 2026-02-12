@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-die() { printf 'git-debug: %s\n' "$*" >&2; exit 1; }
+die() { printf 'git-local: %s\n' "$*" >&2; exit 1; }
 
 init() {
     GIT_DIR=$(git rev-parse --git-dir 2>/dev/null) || die "not in a git repository"
     REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || die "cannot find repo root"
-    MARKS_FILE="$GIT_DIR/debug-marks"
+    MARKS_FILE="$GIT_DIR/local-marks"
 }
 
 # Resolve a path (relative to cwd or absolute) to repo-root-relative
@@ -44,7 +44,7 @@ stored_hash_for() {
 # ── mark ─────────────────────────────────────────────────────────────────────
 
 cmd_mark() {
-    [[ $# -eq 0 ]] && die "usage: git debug mark <file>..."
+    [[ $# -eq 0 ]] && die "usage: git local mark <file>..."
     init
 
     for file in "$@"; do
@@ -70,7 +70,7 @@ cmd_mark() {
 # ── unmark ───────────────────────────────────────────────────────────────────
 
 cmd_unmark() {
-    [[ $# -eq 0 ]] && die "usage: git debug unmark <file>..."
+    [[ $# -eq 0 ]] && die "usage: git local unmark <file>..."
     init
 
     for file in "$@"; do
@@ -190,7 +190,7 @@ case "${1:-help}" in
     watch)  shift; cmd_watch "$@" ;;
     help|-h|--help)
         cat <<'USAGE'
-usage: git debug <command> [args]
+usage: git local <command> [args]
 
 commands:
   mark <file>...    Snapshot file content and hide from git status/diff
@@ -203,8 +203,8 @@ Files are hidden via --skip-worktree as long as their content hash
 matches the snapshot taken at mark time. When the content diverges,
 'sync' (or 'watch') detects the mismatch and reveals the file to git.
 
-After committing real changes, re-run 'mark' to re-hide debug edits.
+After committing real changes, re-run 'mark' to re-hide local edits.
 USAGE
         ;;
-    *)  die "unknown command: $1 (see 'git debug help')" ;;
+    *)  die "unknown command: $1 (see 'git local help')" ;;
 esac

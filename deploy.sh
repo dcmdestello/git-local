@@ -2,7 +2,7 @@
 set -euo pipefail
 
 TARGET_DIR="$HOME/bin"
-SCRIPT_NAME="git-debug"
+SCRIPT_NAME="git-local"
 SOURCE_FILE="./$SCRIPT_NAME"
 
 # Ensure target directory exists
@@ -21,5 +21,5 @@ if [[ ":$PATH:" != *":$TARGET_DIR:"* ]]; then
     echo "Add this to your ~/.zshrc or ~/.bashrc:"
     echo "  export PATH=\"\$HOME/bin:\$PATH\""
 else
-    echo "Success! You can now use 'git debug' anywhere."
+    echo "Success! You can now use 'git local' anywhere."
 fi
