@@ -310,7 +310,7 @@ cmd_interactive() {
     # Temporary per-group arrays (each entry is "idx" into the parallel arrays)
     local g_changed=() g_modified=() g_untracked=() g_hidden=()
 
-    # ── Collect marked files (split into changed, hidden, or excluded) ──
+    # ── Collect marked files (split into changed or hidden) ──
     if [[ -f "$MARKS_FILE" ]]; then
         while IFS=' ' read -r stored_hash path || [[ -n "$stored_hash" ]]; do
             [[ -z "$stored_hash" || -z "$path" ]] && continue
@@ -320,7 +320,7 @@ cmd_interactive() {
             # Untracked files hidden via exclude — show in hidden group
             if [[ "$stored_hash" == "untracked" ]]; then
                 if [[ -f "$REPO_ROOT/$path" ]]; then
-                    g_hidden+=("$path|true|false|true|$path ${C_GREEN}(excluded)${C_RST}|x")
+                    g_hidden+=("$path|true|false|true|$path ${C_GREEN}(hidden, untracked)${C_RST}|x")
                 else
                     # File deleted, auto-clean
                     drop_entry "$path"
@@ -350,7 +350,7 @@ cmd_interactive() {
     while IFS= read -r -d '' path; do
         _seen "$path" && continue
         seen+=("$path")
-        g_modified+=("$path|false|false|false|$path ${C_CYAN}(modified)${C_RST}| ")
+        g_modified+=("$path|false|false|false|$path ${C_DIM}(modified)${C_RST}| ")
     done < <(git -C "$REPO_ROOT" diff -z --name-only)
 
     # ── Collect untracked files ──
@@ -700,8 +700,8 @@ cmd_status() {
 
     [[ -f "$MARKS_FILE" && -s "$MARKS_FILE" ]] || { echo "no files marked"; return 0; }
 
-    printf "${C_BOLD}%-45s  %-8s  %s${C_RST}\n" "FILE" "STATE" "HASH"
-    printf "${C_DIM}%-45s  %-8s  %s${C_RST}\n" "----" "-----" "----"
+    printf "${C_BOLD}%-45s  %-18s  %s${C_RST}\n" "FILE" "STATE" "HASH"
+    printf "${C_DIM}%-45s  %-18s  %s${C_RST}\n" "----" "-----" "----"
 
     while IFS=' ' read -r stored_hash path || [[ -n "$stored_hash" ]]; do
         [[ -z "$stored_hash" ]] && continue
@@ -709,7 +709,7 @@ cmd_status() {
         local state state_color hash_display
 
         if [[ "$stored_hash" == "untracked" ]]; then
-            state="excluded"
+            state="hidden, untracked"
             state_color="$C_GREEN"
             hash_display="-"
         elif [[ ! -f "$full" ]]; then
@@ -729,7 +729,7 @@ cmd_status() {
             hash_display="${stored_hash:0:8}"
         fi
 
-        printf "%-45s  ${state_color}%-8s${C_RST}  ${C_DIM}%s${C_RST}\n" "$path" "$state" "$hash_display"
+        printf "%-45s  ${state_color}%-18s${C_RST}  ${C_DIM}%s${C_RST}\n" "$path" "$state" "$hash_display"
     done < "$MARKS_FILE"
 }
 
