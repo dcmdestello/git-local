@@ -1,11 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ── global config ─────────────────────────────────────────────────────────────
+
+GLOBAL_DIR="$HOME/.git-local"
+GLOBAL_REGISTRY="$GLOBAL_DIR/registry"
+GLOBAL_PID="$GLOBAL_DIR/daemon.pid"
+GLOBAL_LOG="$GLOBAL_DIR/daemon.log"
+LAUNCH_AGENT_LABEL="com.user.git-local"
+LAUNCH_AGENT_PATH="$HOME/Library/LaunchAgents/$LAUNCH_AGENT_LABEL.plist"
+
 die() { printf 'git-local: %s\n' "$*" >&2; exit 1; }
 
 init() {
     GIT_DIR=$(git rev-parse --git-dir 2>/dev/null) || die "not in a git repository"
     REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || die "cannot find repo root"
+    MARKS_FILE="$GIT_DIR/local-marks"
+    PID_FILE="$GIT_DIR/git-local.pid"
+    LOG_FILE="$GIT_DIR/git-local.log"
+}
+
+init_for_repo() {
+    REPO_ROOT="$1"
+    GIT_DIR="$REPO_ROOT/.git"
+    [[ -d "$GIT_DIR" ]] || return 1
     MARKS_FILE="$GIT_DIR/local-marks"
     PID_FILE="$GIT_DIR/git-local.pid"
     LOG_FILE="$GIT_DIR/git-local.log"
@@ -43,7 +61,7 @@ stored_hash_for() {
     done < "$MARKS_FILE"
 }
 
-# Check if watcher daemon is running
+# Check if per-repo watcher daemon is running
 is_running() {
     [[ -f "$PID_FILE" ]] || return 1
     local pid
@@ -56,7 +74,42 @@ is_running() {
     fi
 }
 
-# ── daemon management ────────────────────────────────────────────────────────
+# ── registry ─────────────────────────────────────────────────────────────────
+
+registry_add() {
+    mkdir -p "$GLOBAL_DIR"
+    local repo="$1"
+    if [[ -f "$GLOBAL_REGISTRY" ]]; then
+        while IFS= read -r line; do
+            [[ "$line" == "$repo" ]] && return 0
+        done < "$GLOBAL_REGISTRY"
+    fi
+    printf '%s\n' "$repo" >> "$GLOBAL_REGISTRY"
+}
+
+registry_remove() {
+    [[ -f "$GLOBAL_REGISTRY" ]] || return 0
+    local repo="$1"
+    local tmp="$GLOBAL_REGISTRY.tmp"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" != "$repo" ]] && printf '%s\n' "$line"
+    done < "$GLOBAL_REGISTRY" > "$tmp"
+    mv "$tmp" "$GLOBAL_REGISTRY"
+}
+
+global_daemon_running() {
+    [[ -f "$GLOBAL_PID" ]] || return 1
+    local pid
+    pid=$(cat "$GLOBAL_PID")
+    kill -0 "$pid" 2>/dev/null
+}
+
+signal_daemon() {
+    global_daemon_running || return 0
+    kill -HUP "$(cat "$GLOBAL_PID")" 2>/dev/null || true
+}
+
+# ── per-repo daemon management ───────────────────────────────────────────────
 
 cmd_watch() {
     init
@@ -64,21 +117,17 @@ cmd_watch() {
         printf 'Watcher already running (PID %s)\n' "$(cat "$PID_FILE")"
         return 0
     fi
-    
-    # Check for fswatch and warn if missing
+
     if ! command -v fswatch >/dev/null 2>&1; then
         printf '\033[33mWarning: fswatch not found.\033[0m\n'
         printf 'Watcher will run in polling mode (every 3s).\n'
         printf 'Install fswatch for instant updates: \033[1mbrew install fswatch\033[0m\n\n'
     fi
-    
-    # Start watcher in background
-    # We call "$0" loop to run the actual watch loop
+
     nohup "$0" loop > "$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
-    # disown not strictly needed with nohup but good practice in some shells
     disown $! 2>/dev/null || true
-    
+
     printf 'Started background watcher (PID %s)\n' "$(cat "$PID_FILE")"
     printf 'Logs at: %s\n' "$LOG_FILE"
     printf 'Run "git local stop" to stop it.\n'
@@ -102,20 +151,34 @@ cmd_restart() {
     cmd_watch
 }
 
+# Called after marks change to keep the right watcher strategy in sync
+notify_watcher() {
+    if [[ -s "$MARKS_FILE" ]]; then
+        registry_add "$REPO_ROOT"
+        if global_daemon_running; then
+            signal_daemon
+        elif is_running; then
+            cmd_restart >/dev/null 2>&1
+        else
+            cmd_watch
+        fi
+    else
+        registry_remove "$REPO_ROOT"
+        if global_daemon_running; then
+            signal_daemon
+        elif is_running; then
+            cmd_stop
+        fi
+    fi
+}
+
 # ── mark ─────────────────────────────────────────────────────────────────────
 
 cmd_mark() {
     init
     if [[ $# -eq 0 ]]; then
         cmd_interactive
-        # Check if we should auto-start/restart watcher after interactive session
-        if [[ -s "$MARKS_FILE" ]]; then
-            if is_running; then
-                cmd_restart
-            else
-                cmd_watch
-            fi
-        fi
+        notify_watcher
         return
     fi
 
@@ -148,13 +211,8 @@ cmd_mark() {
 
         printf 'marked: %s (%s)\n' "$rel" "${hash:0:8}"
     done
-    
-    # Restart watcher to pick up new files (or start if not running)
-    if is_running; then
-        cmd_restart >/dev/null 2>&1
-    else
-        cmd_watch
-    fi
+
+    notify_watcher
 }
 
 # ── interactive ──────────────────────────────────────────────────────────────
@@ -189,13 +247,6 @@ cmd_interactive() {
 
     # Read modified files
     while IFS= read -r -d '' path; do
-        # Normalize relative to repo root
-        # git diff --relative returns path relative to CWD. Need full repo path.
-        # But wait, we want to show path relative to repo root usually.
-        # Let's assume run from root for simplicity, or fix paths.
-        
-        # Actually, let's just use git diff --name-only (no --relative) from root
-        # to get consistent paths matching our marks file.
         local exists=false
         if [[ ${#candidates[@]} -gt 0 ]]; then
             for c in "${candidates[@]}"; do [[ "$c" == "$path" ]] && exists=true; done
@@ -213,8 +264,6 @@ cmd_interactive() {
         return 0
     fi
 
-    # Sort candidates? Ideally yes, but let's keep it simple.
-
     local current=0
     local total=${#candidates[@]}
 
@@ -224,9 +273,6 @@ cmd_interactive() {
     trap "printf '\033[?25h'" EXIT
 
     while true; do
-        # Clear screen/move to top (simplified: just clear and reprint)
-        # Better: Save cursor, print, restore.
-        # Or just clear screen on each frame if list fits.
         printf '\033[2J\033[H' # Clear screen and home
         
         echo "Select files to MARK (hide changes):"
@@ -322,8 +368,6 @@ cmd_unmark() {
     [[ $# -eq 0 ]] && die "usage: git local unmark <pathspec>... (e.g. . or *)"
     init
 
-    # Read all currently marked files into an associative array for O(1) lookup
-    # (Using a simpler linear scan since bash <4 assoc arrays are tricky, and list is short)
     local marks=()
     while IFS=' ' read -r _ path || [[ -n "$path" ]]; do
         [[ -n "$path" ]] && marks+=("$path")
@@ -331,13 +375,9 @@ cmd_unmark() {
 
     [[ ${#marks[@]} -eq 0 ]] && { echo "no files currently marked"; return 0; }
 
-    # List files matching the user's pathspecs, then check if they are marked
     local found_any=false
     
     while IFS= read -r -d '' cand; do
-        # git ls-files returns paths relative to CWD. Normalize to repo root relative.
-        # But repo_relative expects a file path relative to CWD or absolute.
-        # cand is relative to CWD, so repo_relative works fine.
         local rel_cand
         rel_cand=$(repo_relative "$cand")
 
@@ -355,19 +395,15 @@ cmd_unmark() {
     if ! $found_any; then
          printf 'no marked files matched arguments\n'
     fi
-    
-    # Restart watcher if marks remain (to update list), or stop if empty
-    if [[ -s "$MARKS_FILE" ]]; then
-        if is_running; then cmd_restart >/dev/null 2>&1; fi
-    else
-        if is_running; then cmd_stop; fi
-    fi
+
+    notify_watcher
 }
 
 # ── sync ─────────────────────────────────────────────────────────────────────
 
-cmd_sync() {
-    init
+# Core sync logic — uses REPO_ROOT/MARKS_FILE set by init or init_for_repo.
+# All git commands use -C to work without requiring cwd to be in the repo.
+do_sync() {
     [[ -f "$MARKS_FILE" && -s "$MARKS_FILE" ]] || return 0
 
     local hashes=() paths=() dirty=false
@@ -384,7 +420,7 @@ cmd_sync() {
         local full="$REPO_ROOT/$p"
 
         if [[ ! -f "$full" ]]; then
-            git update-index --no-skip-worktree -- "$p" 2>/dev/null || true
+            git -C "$REPO_ROOT" update-index --no-skip-worktree -- "$p" 2>/dev/null || true
             hashes[$i]=""
             paths[$i]=""
             dirty=true
@@ -392,23 +428,20 @@ cmd_sync() {
             continue
         fi
 
-        # Check current status: S=skip-worktree (hidden), anything else=visible
         local status_char
-        status_char=$(git ls-files -v -- "$p" | cut -c1)
+        status_char=$(git -C "$REPO_ROOT" ls-files -v -- "$p" | cut -c1)
 
         local current
         current=$(git hash-object "$full")
 
         if [[ "$current" == "$stored" ]]; then
-            # Content matches stored hash -> Ensure hidden (S)
             if [[ "$status_char" != "S" ]]; then
-                git update-index --skip-worktree -- "$p" 2>/dev/null || true
+                git -C "$REPO_ROOT" update-index --skip-worktree -- "$p" 2>/dev/null || true
                 printf 'hidden: %s (content matches)\n' "$p"
             fi
         else
-            # Content differs -> Ensure visible (not S)
             if [[ "$status_char" == "S" ]]; then
-                git update-index --no-skip-worktree -- "$p" 2>/dev/null || true
+                git -C "$REPO_ROOT" update-index --no-skip-worktree -- "$p" 2>/dev/null || true
                 printf 'revealed: %s (content changed)\n' "$p"
             fi
         fi
@@ -424,18 +457,24 @@ cmd_sync() {
     fi
 }
 
+cmd_sync() {
+    init
+    do_sync
+}
+
 # ── status ───────────────────────────────────────────────────────────────────
 
 cmd_status() {
     init
-    
-    # Show daemon status
-    if is_running; then
+
+    if global_daemon_running; then
+        printf 'Watcher: \033[32mRUNNING\033[0m (managed by global daemon, PID %s)\n' "$(cat "$GLOBAL_PID")"
+    elif is_running; then
         printf 'Watcher: \033[32mRUNNING\033[0m (PID %s)\n' "$(cat "$PID_FILE")"
     else
         printf 'Watcher: \033[31mSTOPPED\033[0m\n'
         if [[ -f "$MARKS_FILE" && -s "$MARKS_FILE" ]]; then
-             printf '(Run "git local watch" to enable auto-sync)\n'
+             printf '(Run "git local watch" or "git local service install" to enable auto-sync)\n'
         fi
     fi
     echo ""
@@ -466,16 +505,14 @@ cmd_status() {
     done < "$MARKS_FILE"
 }
 
-# ── loop ─────────────────────────────────────────────────────────────────────
+# ── per-repo loop ────────────────────────────────────────────────────────────
 
 cmd_loop() {
     init
     
-    # Check for fswatch
     if command -v fswatch >/dev/null 2>&1; then
         printf 'Watching for changes with fswatch...\n'
         
-        # Build list of specific files to watch
         local watch_paths=()
         if [[ -f "$MARKS_FILE" ]]; then
             while IFS=' ' read -r _ path || [[ -n "$path" ]]; do
@@ -485,16 +522,10 @@ cmd_loop() {
         
         if [[ ${#watch_paths[@]} -eq 0 ]]; then
             printf 'No files to watch.\n'
-            # Loop forever doing nothing? Or exit?
-            # If we exit, the daemon dies.
-            # But unmark stops the daemon if empty.
-            # So this case should be rare.
             sleep 3600
         else
-            # Watch ONLY the marked files
-            # Optimization: latency 1s
             fswatch -o -l 1 "${watch_paths[@]}" | while read -r _; do
-                cmd_sync # Run ONCE
+                cmd_sync
             done
         fi
     else
@@ -509,6 +540,185 @@ cmd_loop() {
     fi
 }
 
+# ── global daemon ────────────────────────────────────────────────────────────
+
+daemon_sync_all() {
+    [[ -f "$GLOBAL_REGISTRY" ]] || return 0
+
+    local stale_repos=()
+    while IFS= read -r repo || [[ -n "$repo" ]]; do
+        [[ -z "$repo" ]] && continue
+
+        if ! init_for_repo "$repo"; then
+            stale_repos+=("$repo")
+            continue
+        fi
+
+        if [[ ! -f "$MARKS_FILE" || ! -s "$MARKS_FILE" ]]; then
+            stale_repos+=("$repo")
+            continue
+        fi
+
+        do_sync
+    done < "$GLOBAL_REGISTRY"
+
+    if [[ ${#stale_repos[@]} -gt 0 ]]; then
+        for repo in "${stale_repos[@]}"; do
+            registry_remove "$repo"
+            printf '[%s] Removed stale: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$repo"
+        done
+    fi
+}
+
+# Collect full paths of all marked files across all repos
+daemon_collect_watch_paths() {
+    DAEMON_WATCH_PATHS=()
+    [[ -f "$GLOBAL_REGISTRY" ]] || return 0
+
+    while IFS= read -r repo || [[ -n "$repo" ]]; do
+        [[ -z "$repo" || ! -d "$repo/.git" ]] && continue
+        local marks="$repo/.git/local-marks"
+        [[ -f "$marks" && -s "$marks" ]] || continue
+        while IFS=' ' read -r _ p || [[ -n "$p" ]]; do
+            [[ -n "$p" ]] && DAEMON_WATCH_PATHS+=("$repo/$p")
+        done < "$marks"
+    done < "$GLOBAL_REGISTRY"
+}
+
+cmd_daemon() {
+    mkdir -p "$GLOBAL_DIR"
+
+    if global_daemon_running; then
+        printf 'Daemon already running (PID %s)\n' "$(cat "$GLOBAL_PID")"
+        exit 1
+    fi
+
+    printf '[%s] Daemon started (PID %s)\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$$"
+    echo $$ > "$GLOBAL_PID"
+
+    trap 'rm -f "$GLOBAL_PID"; exit 0' TERM INT
+    # SIGHUP interrupts fswatch/sleep, causing an immediate re-sync cycle
+    trap 'true' HUP
+
+    if command -v fswatch >/dev/null 2>&1; then
+        printf '[%s] Using fswatch\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+        while true; do
+            daemon_sync_all
+            daemon_collect_watch_paths
+
+            if [[ ${#DAEMON_WATCH_PATHS[@]} -gt 0 ]]; then
+                # Block until a watched file changes, or SIGHUP interrupts
+                fswatch -1 -l 1 "${DAEMON_WATCH_PATHS[@]}" >/dev/null 2>&1 || true
+            else
+                sleep 30 || true
+            fi
+        done
+    else
+        printf '[%s] Using polling (every 5s)\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+        while true; do
+            daemon_sync_all
+            sleep 5 || true
+        done
+    fi
+}
+
+cmd_install_service() {
+    local script_path
+    script_path="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+
+    mkdir -p "$GLOBAL_DIR"
+    mkdir -p "$(dirname "$LAUNCH_AGENT_PATH")"
+
+    if [[ -f "$LAUNCH_AGENT_PATH" ]]; then
+        printf 'LaunchAgent already exists at %s\n' "$LAUNCH_AGENT_PATH"
+        printf 'Run "git local service uninstall" first to reinstall.\n'
+        return 1
+    fi
+
+    cat > "$LAUNCH_AGENT_PATH" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${LAUNCH_AGENT_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${script_path}</string>
+        <string>daemon</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>${GLOBAL_LOG}</string>
+    <key>StandardErrorPath</key>
+    <string>${GLOBAL_LOG}</string>
+</dict>
+</plist>
+PLIST
+
+    launchctl load -w "$LAUNCH_AGENT_PATH"
+
+    printf 'Installed global daemon service.\n'
+    printf 'LaunchAgent: %s\n' "$LAUNCH_AGENT_PATH"
+    printf 'Logs: %s\n' "$GLOBAL_LOG"
+    printf '\nRun "git local service" to verify.\n'
+}
+
+cmd_uninstall_service() {
+    if [[ ! -f "$LAUNCH_AGENT_PATH" ]]; then
+        printf 'No LaunchAgent found at %s\n' "$LAUNCH_AGENT_PATH"
+        return 1
+    fi
+
+    launchctl unload -w "$LAUNCH_AGENT_PATH" 2>/dev/null || true
+    rm -f "$LAUNCH_AGENT_PATH"
+    rm -f "$GLOBAL_PID"
+
+    printf 'Uninstalled global daemon service.\n'
+}
+
+cmd_service_status() {
+    if global_daemon_running; then
+        printf 'Global Daemon: \033[32mRUNNING\033[0m (PID %s)\n' "$(cat "$GLOBAL_PID")"
+    else
+        printf 'Global Daemon: \033[31mSTOPPED\033[0m\n'
+    fi
+
+    if [[ -f "$LAUNCH_AGENT_PATH" ]]; then
+        printf 'LaunchAgent: installed\n'
+    else
+        printf 'LaunchAgent: not installed (run "git local service install")\n'
+    fi
+
+    if command -v fswatch >/dev/null 2>&1; then
+        printf 'Watch mode: fswatch (event-driven)\n'
+    else
+        printf 'Watch mode: polling (every 5s)\n'
+        printf '  Install fswatch for instant detection: \033[1mbrew install fswatch\033[0m\n'
+    fi
+    printf 'Logs: %s\n' "$GLOBAL_LOG"
+
+    if [[ -f "$GLOBAL_REGISTRY" && -s "$GLOBAL_REGISTRY" ]]; then
+        local count
+        count=$(wc -l < "$GLOBAL_REGISTRY" | tr -d ' ')
+        printf '\nRegistered repos (%s):\n' "$count"
+        while IFS= read -r repo; do
+            [[ -z "$repo" ]] && continue
+            local marks_count=0
+            local marks_file="$repo/.git/local-marks"
+            if [[ -f "$marks_file" && -s "$marks_file" ]]; then
+                marks_count=$(wc -l < "$marks_file" | tr -d ' ')
+            fi
+            printf '  %s (%s files)\n' "$repo" "$marks_count"
+        done < "$GLOBAL_REGISTRY"
+    else
+        printf '\nNo repos registered.\n'
+    fi
+}
+
 # ── main ─────────────────────────────────────────────────────────────────────
 
 case "${1:-help}" in
@@ -520,6 +730,16 @@ case "${1:-help}" in
     stop)   shift; cmd_stop "$@" ;;
     restart) shift; cmd_restart "$@" ;;
     loop)   shift; cmd_loop "$@" ;;
+    daemon) shift; cmd_daemon "$@" ;;
+    service)
+        shift
+        case "${1:-status}" in
+            install)   cmd_install_service ;;
+            uninstall) cmd_uninstall_service ;;
+            status)    cmd_service_status ;;
+            *)         die "unknown service command: $1 (try install, uninstall, status)" ;;
+        esac
+        ;;
     help|-h|--help)
         cat <<'USAGE'
 usage: git local <command> [args]
@@ -530,9 +750,14 @@ commands:
   unmark <spec>...  Unmark matching files
   sync              Re-check marked files; reveal any with real changes
   status            List marked files and their current state
-  watch             Start background watcher (auto-starts on mark)
-  stop              Stop background watcher
-  restart           Restart background watcher
+  watch             Start per-repo background watcher (auto-starts on mark)
+  stop              Stop per-repo background watcher
+  restart           Restart per-repo background watcher
+
+global daemon:
+  service           Show global daemon status (alias: service status)
+  service install   Install global daemon (survives reboots)
+  service uninstall Remove global daemon
 
 Files are hidden via --skip-worktree as long as their content hash
 matches the snapshot taken at mark time. When the content diverges,
@@ -541,7 +766,8 @@ the watcher detects the mismatch and reveals the file to git.
 After committing real changes, re-run 'mark' to re-hide local edits.
 
 The watcher auto-starts when you mark files and auto-stops
-when all files are unmarked.
+when all files are unmarked. If the global daemon is installed,
+it manages all repos automatically (including after reboots).
 USAGE
         ;;
     *)  die "unknown command: $1 (see 'git local help')" ;;
