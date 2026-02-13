@@ -10,14 +10,21 @@ GLOBAL_LOG="$GLOBAL_DIR/daemon.log"
 LAUNCH_AGENT_LABEL="com.user.git-local"
 LAUNCH_AGENT_PATH="$HOME/Library/LaunchAgents/$LAUNCH_AGENT_LABEL.plist"
 
-die() { printf 'git-local: %s\n' "$*" >&2; exit 1; }
+# ── colors (disabled when output is not a terminal) ──────────────────────────
+
+if [[ -t 1 ]]; then
+    C_RED='\033[31m' C_GREEN='\033[32m' C_YELLOW='\033[33m'
+    C_CYAN='\033[36m' C_DIM='\033[2m' C_BOLD='\033[1m' C_RST='\033[0m'
+else
+    C_RED='' C_GREEN='' C_YELLOW='' C_CYAN='' C_DIM='' C_BOLD='' C_RST=''
+fi
+
+die() { printf "${C_RED}git-local: %s${C_RST}\n" "$*" >&2; exit 1; }
 
 init() {
     GIT_DIR=$(git rev-parse --git-dir 2>/dev/null) || die "not in a git repository"
     REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || die "cannot find repo root"
     MARKS_FILE="$GIT_DIR/local-marks"
-    PID_FILE="$GIT_DIR/git-local.pid"
-    LOG_FILE="$GIT_DIR/git-local.log"
 }
 
 init_for_repo() {
@@ -25,8 +32,6 @@ init_for_repo() {
     GIT_DIR="$REPO_ROOT/.git"
     [[ -d "$GIT_DIR" ]] || return 1
     MARKS_FILE="$GIT_DIR/local-marks"
-    PID_FILE="$GIT_DIR/git-local.pid"
-    LOG_FILE="$GIT_DIR/git-local.log"
 }
 
 # Resolve a path (relative to cwd or absolute) to repo-root-relative
@@ -35,6 +40,80 @@ repo_relative() {
     abs="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
     printf '%s' "${abs#"$REPO_ROOT"/}"
 }
+
+# ── exclude helpers (for untracked files) ────────────────────────────────────
+
+_EXCL_BEGIN="# git-local begin"
+_EXCL_END="# git-local end"
+
+# Read current git-local exclude entries into an array
+_excl_read() {
+    _EXCL_ENTRIES=()
+    local exclude="$GIT_DIR/info/exclude"
+    [[ -f "$exclude" ]] || return 0
+    local in_block=false
+    while IFS= read -r line; do
+        if [[ "$line" == "$_EXCL_BEGIN" ]]; then in_block=true; continue; fi
+        if [[ "$line" == "$_EXCL_END" ]]; then in_block=false; continue; fi
+        if $in_block; then _EXCL_ENTRIES+=("$line"); fi
+    done < "$exclude"
+}
+
+# Rewrite the exclude file with the given entries
+_excl_write() {
+    local exclude="$GIT_DIR/info/exclude"
+    mkdir -p "$GIT_DIR/info"
+    # Read lines outside our block
+    local other_lines=()
+    if [[ -f "$exclude" ]]; then
+        local in_block=false
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            if [[ "$line" == "$_EXCL_BEGIN" ]]; then in_block=true; continue; fi
+            if [[ "$line" == "$_EXCL_END" ]]; then in_block=false; continue; fi
+            if ! $in_block; then other_lines+=("$line"); fi
+        done < "$exclude"
+    fi
+    # Write back other lines + our block
+    local tmp="$exclude.tmp"
+    for line in ${other_lines[@]+"${other_lines[@]}"}; do
+        printf '%s\n' "$line"
+    done > "$tmp"
+    if [[ ${#_EXCL_ENTRIES[@]} -gt 0 ]]; then
+        printf '%s\n' "$_EXCL_BEGIN" >> "$tmp"
+        for entry in "${_EXCL_ENTRIES[@]}"; do
+            printf '%s\n' "$entry"
+        done >> "$tmp"
+        printf '%s\n' "$_EXCL_END" >> "$tmp"
+    fi
+    mv "$tmp" "$exclude"
+}
+
+exclude_add() {
+    local path="$1"
+    _excl_read
+    # Don't duplicate
+    for e in ${_EXCL_ENTRIES[@]+"${_EXCL_ENTRIES[@]}"}; do
+        [[ "$e" == "$path" ]] && return 0
+    done
+    _EXCL_ENTRIES+=("$path")
+    _excl_write
+}
+
+exclude_remove() {
+    local path="$1"
+    _excl_read
+    local new_entries=()
+    for e in ${_EXCL_ENTRIES[@]+"${_EXCL_ENTRIES[@]}"}; do
+        [[ "$e" != "$path" ]] && new_entries+=("$e")
+    done
+    _EXCL_ENTRIES=()
+    for e in ${new_entries[@]+"${new_entries[@]}"}; do
+        _EXCL_ENTRIES+=("$e")
+    done
+    _excl_write
+}
+
+# ── marks helpers ────────────────────────────────────────────────────────────
 
 # Remove a path's entry from the marks file
 drop_entry() {
@@ -59,19 +138,6 @@ stored_hash_for() {
             return 0
         fi
     done < "$MARKS_FILE"
-}
-
-# Check if per-repo watcher daemon is running
-is_running() {
-    [[ -f "$PID_FILE" ]] || return 1
-    local pid
-    pid=$(cat "$PID_FILE")
-    if kill -0 "$pid" 2>/dev/null; then
-        return 0
-    else
-        rm "$PID_FILE" # Stale PID file
-        return 1
-    fi
 }
 
 # ── registry ─────────────────────────────────────────────────────────────────
@@ -109,66 +175,17 @@ signal_daemon() {
     kill -HUP "$(cat "$GLOBAL_PID")" 2>/dev/null || true
 }
 
-# ── per-repo daemon management ───────────────────────────────────────────────
-
-cmd_watch() {
-    init
-    if is_running; then
-        printf 'Watcher already running (PID %s)\n' "$(cat "$PID_FILE")"
-        return 0
-    fi
-
-    if ! command -v fswatch >/dev/null 2>&1; then
-        printf '\033[33mWarning: fswatch not found.\033[0m\n'
-        printf 'Watcher will run in polling mode (every 3s).\n'
-        printf 'Install fswatch for instant updates: \033[1mbrew install fswatch\033[0m\n\n'
-    fi
-
-    nohup "$0" loop > "$LOG_FILE" 2>&1 &
-    echo $! > "$PID_FILE"
-    disown $! 2>/dev/null || true
-
-    printf 'Started background watcher (PID %s)\n' "$(cat "$PID_FILE")"
-    printf 'Logs at: %s\n' "$LOG_FILE"
-    printf 'Run "git local stop" to stop it.\n'
-}
-
-cmd_stop() {
-    init
-    if is_running; then
-        local pid
-        pid=$(cat "$PID_FILE")
-        kill "$pid" 2>/dev/null || true
-        rm "$PID_FILE"
-        printf 'Stopped watcher (PID %s)\n' "$pid"
-    else
-        printf 'Watcher is not running.\n'
-    fi
-}
-
-cmd_restart() {
-    cmd_stop
-    cmd_watch
-}
-
-# Called after marks change to keep the right watcher strategy in sync
+# Called after marks change to keep the daemon in sync
 notify_watcher() {
     if [[ -s "$MARKS_FILE" ]]; then
         registry_add "$REPO_ROOT"
-        if global_daemon_running; then
-            signal_daemon
-        elif is_running; then
-            cmd_restart >/dev/null 2>&1
-        else
-            cmd_watch
-        fi
     else
         registry_remove "$REPO_ROOT"
-        if global_daemon_running; then
-            signal_daemon
-        elif is_running; then
-            cmd_stop
-        fi
+    fi
+    if global_daemon_running; then
+        signal_daemon
+    else
+        printf "${C_YELLOW}Note: daemon is not running. Run \"git local service install\" to enable auto-sync.${C_RST}\n"
     fi
 }
 
@@ -182,25 +199,26 @@ cmd_mark() {
         return
     fi
 
-    # Capture files into an array using -z for safety with spaces/special chars
+    # Collect modified tracked files
     local files=()
     while IFS= read -r -d '' file; do
         files+=("$file")
     done < <(git diff -z --name-only --relative -- "$@")
 
-    if [[ ${#files[@]} -eq 0 ]]; then
-        printf 'no modified files found matching arguments\n'
+    # Also collect untracked files matching the arguments
+    local untracked=()
+    while IFS= read -r -d '' file; do
+        untracked+=("$file")
+    done < <(git ls-files -z --others --exclude-standard -- "$@")
+
+    if [[ ${#files[@]} -eq 0 && ${#untracked[@]} -eq 0 ]]; then
+        printf 'no modified or untracked files found matching arguments\n'
         return 0
     fi
 
-    for file in "${files[@]}"; do
-        # git diff output is relative to CWD (due to --relative), which repo_relative handles
+    for file in ${files[@]+"${files[@]}"}; do
         local rel
         rel=$(repo_relative "$file")
-
-        # Double check it's tracked (git diff usually implies it, but good to be safe)
-        git ls-files --error-unmatch -- "$rel" >/dev/null 2>&1 \
-            || { printf 'skipping untracked: %s\n' "$rel"; continue; }
 
         local hash
         hash=$(git hash-object "$REPO_ROOT/$rel")
@@ -209,155 +227,329 @@ cmd_mark() {
         printf '%s %s\n' "$hash" "$rel" >> "$MARKS_FILE"
         git update-index --skip-worktree -- "$rel"
 
-        printf 'marked: %s (%s)\n' "$rel" "${hash:0:8}"
+        printf "${C_GREEN}marked:${C_RST} %s ${C_DIM}(%s)${C_RST}\n" "$rel" "${hash:0:8}"
     done
+
+    for file in ${untracked[@]+"${untracked[@]}"}; do
+        local rel
+        rel=$(repo_relative "$file")
+
+        exclude_add "$rel"
+        drop_entry "$rel"
+        printf '%s %s\n' "untracked" "$rel" >> "$MARKS_FILE"
+
+        printf "${C_GREEN}marked:${C_RST} %s ${C_DIM}(untracked)${C_RST}\n" "$rel"
+    done
+
+    notify_watcher
+}
+
+cmd_remark() {
+    init
+    [[ -f "$MARKS_FILE" && -s "$MARKS_FILE" ]] || { echo "no files marked"; return 0; }
+
+    local new_marks=() remarked=0 unchanged=0
+
+    while IFS=' ' read -r stored_hash path || [[ -n "$stored_hash" ]]; do
+        [[ -z "$stored_hash" || -z "$path" ]] && continue
+
+        # Untracked files are hidden via exclude, no hash to update
+        if [[ "$stored_hash" == "untracked" ]]; then
+            new_marks+=("untracked $path")
+            ((unchanged++)) || true
+            continue
+        fi
+
+        if [[ ! -f "$REPO_ROOT/$path" ]]; then
+            git update-index --no-skip-worktree -- "$path" 2>/dev/null || true
+            continue
+        fi
+
+        local current
+        current=$(git hash-object "$REPO_ROOT/$path")
+
+        if [[ "$current" != "$stored_hash" ]]; then
+            new_marks+=("$current $path")
+            git update-index --skip-worktree -- "$path" 2>/dev/null || true
+            printf "${C_CYAN}re-marked:${C_RST} %s\n" "$path"
+            ((remarked++)) || true
+        else
+            new_marks+=("$stored_hash $path")
+            ((unchanged++)) || true
+        fi
+    done < "$MARKS_FILE"
+
+    # Rewrite marks file
+    local tmp="$MARKS_FILE.tmp"
+    printf '%s\n' "${new_marks[@]}" > "$tmp"
+    mv "$tmp" "$MARKS_FILE"
+
+    if [[ $remarked -eq 0 ]]; then
+        printf 'all %s files already up to date\n' "$unchanged"
+    else
+        [[ $unchanged -gt 0 ]] && printf "${C_DIM}%s files unchanged${C_RST}\n" "$unchanged"
+    fi
 
     notify_watcher
 }
 
 # ── interactive ──────────────────────────────────────────────────────────────
 
+# Helper: check if a path has been seen already
+_seen() {
+    local target="$1"
+    for s in "${seen[@]+"${seen[@]}"}"; do [[ "$s" == "$target" ]] && return 0; done
+    return 1
+}
+
+# Helper: append a separator sentinel between non-empty groups
+_add_separator() {
+    local len=${#candidates[@]}
+    [[ $len -gt 0 && "${candidates[$((len-1))]}" != "" ]] || return 0
+    candidates+=("")
+    display_names+=("")
+    selected+=(false)
+    is_marked+=(false)
+    is_changed+=(false)
+    is_untracked+=(false)
+}
+
 cmd_interactive() {
-    # Gather candidates:
-    # 1. Currently marked files
-    # 2. Modified files (unstaged changes)
-    
+    # Collect into groups, then merge: changed → modified → untracked → hidden
+    # Sentinel entries (empty candidate) act as visual separators.
+
+    local seen=()
     local candidates=()
     local display_names=()
     local selected=()
     local is_marked=()
+    local is_changed=()
+    local is_untracked=()
 
-    # Read marked files
+    # Temporary per-group arrays (each entry is "idx" into the parallel arrays)
+    local g_changed=() g_modified=() g_untracked=() g_hidden=()
+
+    # ── Collect marked files (split into changed, hidden, or excluded) ──
     if [[ -f "$MARKS_FILE" ]]; then
-        while IFS=' ' read -r _ path || [[ -n "$path" ]]; do
-            [[ -z "$path" ]] && continue
-            # Avoid duplicates if file is both marked AND modified (can happen if revealed)
-            local exists=false
-            if [[ ${#candidates[@]} -gt 0 ]]; then
-                for c in "${candidates[@]}"; do [[ "$c" == "$path" ]] && exists=true; done
+        while IFS=' ' read -r stored_hash path || [[ -n "$stored_hash" ]]; do
+            [[ -z "$stored_hash" || -z "$path" ]] && continue
+            _seen "$path" && continue
+            seen+=("$path")
+
+            # Untracked files hidden via exclude — show in hidden group
+            if [[ "$stored_hash" == "untracked" ]]; then
+                if [[ -f "$REPO_ROOT/$path" ]]; then
+                    g_hidden+=("$path|true|false|true|$path ${C_GREEN}(excluded)${C_RST}|true")
+                else
+                    # File deleted, auto-clean
+                    drop_entry "$path"
+                    exclude_remove "$path"
+                fi
+                continue
             fi
-            if ! $exists; then
-                candidates+=("$path")
-                display_names+=("$path (marked)")
-                selected+=(true)
-                is_marked+=(true)
+
+            # Auto-clean deleted tracked files
+            if [[ ! -f "$REPO_ROOT/$path" ]]; then
+                drop_entry "$path"
+                git update-index --no-skip-worktree -- "$path" 2>/dev/null || true
+                continue
+            fi
+
+            local current_hash
+            current_hash=$(git hash-object "$REPO_ROOT/$path")
+            if [[ "$current_hash" == "$stored_hash" ]]; then
+                g_hidden+=("$path|true|false|false|$path ${C_GREEN}(hidden)${C_RST}|true")
+            else
+                g_changed+=("$path|true|true|false|$path ${C_YELLOW}(changed)${C_RST}|false")
             fi
         done < "$MARKS_FILE"
     fi
 
-    # Read modified files
+    # ── Collect modified files ──
     while IFS= read -r -d '' path; do
-        local exists=false
-        if [[ ${#candidates[@]} -gt 0 ]]; then
-            for c in "${candidates[@]}"; do [[ "$c" == "$path" ]] && exists=true; done
-        fi
-        if ! $exists; then
-            candidates+=("$path")
-            display_names+=("$path (modified)")
-            selected+=(false)
-            is_marked+=(false)
-        fi
+        _seen "$path" && continue
+        seen+=("$path")
+        g_modified+=("$path|false|false|false|$path ${C_CYAN}(modified)${C_RST}|false")
     done < <(git diff -z --name-only "$REPO_ROOT")
 
+    # ── Collect untracked files ──
+    while IFS= read -r -d '' path; do
+        _seen "$path" && continue
+        seen+=("$path")
+        g_untracked+=("$path|false|false|true|$path ${C_DIM}(untracked)${C_RST}|false")
+    done < <(git ls-files -z --others --exclude-standard "$REPO_ROOT")
+
+    # ── Merge groups in order: changed → modified → untracked → hidden ──
+    _unpack_group() {
+        for entry in "$@"; do
+            local IFS='|'
+            read -r _p _m _c _u _d _s <<< "$entry"
+            candidates+=("$_p")
+            is_marked+=("$_m")
+            is_changed+=("$_c")
+            is_untracked+=("$_u")
+            display_names+=("$_d")
+            selected+=("$_s")
+        done
+    }
+
+    local first_group=true
+    for group_name in g_changed g_modified g_untracked g_hidden; do
+        eval "local group_size=\${#${group_name}[@]}"
+        [[ $group_size -eq 0 ]] && continue
+        if $first_group; then
+            first_group=false
+        else
+            _add_separator
+        fi
+        eval '_unpack_group "${'"$group_name"'[@]}"'
+    done
+
     if [[ ${#candidates[@]} -eq 0 ]]; then
-        echo "No modified or marked files found."
+        echo "No modified, untracked, or marked files found."
         return 0
     fi
 
     local current=0
     local total=${#candidates[@]}
 
-    # TUI Loop
-    # Hide cursor
+    # Skip sentinel if cursor starts on one
+    while [[ $current -lt $total && -z "${candidates[$current]}" ]]; do
+        ((current++)) || true
+    done
+
+    # ── Navigation helpers (skip sentinels) ──
+    _move_down() {
+        local start=$current
+        while true; do
+            ((current++)) || true
+            [[ $current -ge $total ]] && current=0
+            [[ -n "${candidates[$current]}" || $current -eq $start ]] && break
+        done
+    }
+    _move_up() {
+        local start=$current
+        while true; do
+            ((current--)) || true
+            [[ $current -lt 0 ]] && current=$((total-1))
+            [[ -n "${candidates[$current]}" || $current -eq $start ]] && break
+        done
+    }
+
+    # ── TUI Loop ──
     printf '\033[?25l'
     trap "printf '\033[?25h'" EXIT
 
     while true; do
-        printf '\033[2J\033[H' # Clear screen and home
-        
-        echo "Select files to MARK (hide changes):"
-        echo "  [Space] toggle, [Enter] confirm, [q] cancel"
-        echo "  [w/s] or [Up/Down] to move"
+        printf '\033[2J\033[H'
+
+        printf "${C_BOLD}Select files to mark (hide from git):${C_RST}\n"
+        printf "  ${C_DIM}[Space] toggle  [Enter] confirm  [q] cancel${C_RST}\n"
+        printf "  ${C_DIM}[w/s] or [Up/Down] to move${C_RST}\n"
         echo ""
 
         for ((i=0; i<total; i++)); do
+            # Sentinel: blank separator line
+            if [[ -z "${candidates[$i]}" ]]; then
+                echo ""
+                continue
+            fi
+
             local cursor=" "
             if [[ $i -eq $current ]]; then cursor=">"; fi
-            
-            local box="[ ]"
-            if ${selected[$i]}; then box="[x]"; fi
-            
-            # Highlight current line
-            if [[ $i -eq $current ]]; then
-                printf "%s \033[7m%s %s\033[0m\n" "$cursor" "$box" "${display_names[$i]}"
+
+            local box
+            if ${selected[$i]}; then
+                box="${C_GREEN}[x]${C_RST}"
             else
-                printf "%s %s %s\n" "$cursor" "$box" "${display_names[$i]}"
+                box="[ ]"
+            fi
+
+            if [[ $i -eq $current ]]; then
+                printf "%s \033[7m%b %b\033[0m\n" "$cursor" "$box" "${display_names[$i]}"
+            else
+                printf "%s %b %b\n" "$cursor" "$box" "${display_names[$i]}"
             fi
         done
 
-        # Read input (1 char)
         local key
         IFS= read -rsn1 key
 
         case "$key" in
-            "") # Enter
-                break
-                ;;
-            "q")
-                return 0
-                ;;
-            " ") # Space
+            "") break ;;
+            "q") return 0 ;;
+            " ")
                 if ${selected[$current]}; then
                     selected[$current]=false
                 else
                     selected[$current]=true
                 fi
                 ;;
-            "s") # Down
-                ((current++)) || true
-                [[ $current -ge $total ]] && current=0
+            "a") # Select all (skip sentinels)
+                for ((ii=0; ii<total; ii++)); do
+                    [[ -n "${candidates[$ii]}" ]] && selected[$ii]=true
+                done
                 ;;
-            "w") # Up
-                ((current--)) || true
-                [[ $current -lt 0 ]] && current=$((total-1))
+            "n") # Deselect all (skip sentinels)
+                for ((ii=0; ii<total; ii++)); do
+                    [[ -n "${candidates[$ii]}" ]] && selected[$ii]=false
+                done
                 ;;
-            $'\x1b') # Escape sequence
-                read -rsn2 -t 1 key # read next 2 chars (1s timeout for macOS bash 3.2)
+            "s"|"j") _move_down ;;
+            "w"|"k") _move_up ;;
+            $'\x1b')
+                read -rsn2 -t 1 key
                 case "$key" in
-                    "[A") # Up
-                        ((current--)) || true
-                        [[ $current -lt 0 ]] && current=$((total-1))
-                        ;;
-                    "[B") # Down
-                        ((current++)) || true
-                        [[ $current -ge $total ]] && current=0
-                        ;;
+                    "[A") _move_up ;;
+                    "[B") _move_down ;;
                 esac
                 ;;
         esac
     done
 
-    # Apply changes
-    printf '\nApplying changes...\n'
-    
+    # ── Apply changes ──
+    printf '\n'
+
     for ((i=0; i<total; i++)); do
         local path="${candidates[$i]}"
+        [[ -z "$path" ]] && continue  # skip sentinels
+
         local was_marked="${is_marked[$i]}"
         local is_selected="${selected[$i]}"
+        local changed="${is_changed[$i]}"
+        local untracked="${is_untracked[$i]}"
 
         if $is_selected && ! $was_marked; then
-            # Mark it
+            # New mark
+            if $untracked; then
+                exclude_add "$path"
+                drop_entry "$path"
+                printf '%s %s\n' "untracked" "$path" >> "$MARKS_FILE"
+            else
+                local hash
+                hash=$(git hash-object "$REPO_ROOT/$path")
+                drop_entry "$path"
+                printf '%s %s\n' "$hash" "$path" >> "$MARKS_FILE"
+                git update-index --skip-worktree -- "$path"
+            fi
+            printf "${C_GREEN}marked:${C_RST} %s\n" "$path"
+        elif $is_selected && $was_marked && $changed; then
+            # Re-mark with updated hash (only for tracked files)
             local hash
             hash=$(git hash-object "$REPO_ROOT/$path")
             drop_entry "$path"
             printf '%s %s\n' "$hash" "$path" >> "$MARKS_FILE"
-            git update-index --skip-worktree -- "$path"
-            printf 'marked: %s\n' "$path"
+            git update-index --skip-worktree -- "$path" 2>/dev/null || true
+            printf "${C_CYAN}re-marked:${C_RST} %s\n" "$path"
         elif ! $is_selected && $was_marked; then
-            # Unmark it
+            # Unmark
             drop_entry "$path"
-            git update-index --no-skip-worktree -- "$path" 2>/dev/null || true
-            printf 'unmarked: %s\n' "$path"
+            if $untracked; then
+                exclude_remove "$path"
+            else
+                git update-index --no-skip-worktree -- "$path" 2>/dev/null || true
+            fi
+            printf "${C_YELLOW}unmarked:${C_RST} %s\n" "$path"
         fi
     done
 }
@@ -368,29 +560,54 @@ cmd_unmark() {
     [[ $# -eq 0 ]] && die "usage: git local unmark <pathspec>... (e.g. . or *)"
     init
 
-    local marks=()
-    while IFS=' ' read -r _ path || [[ -n "$path" ]]; do
-        [[ -n "$path" ]] && marks+=("$path")
+    local tracked_marks=() untracked_marks=()
+    while IFS=' ' read -r hash path || [[ -n "$hash" ]]; do
+        [[ -z "$hash" || -z "$path" ]] && continue
+        if [[ "$hash" == "untracked" ]]; then
+            untracked_marks+=("$path")
+        else
+            tracked_marks+=("$path")
+        fi
     done < "$MARKS_FILE"
 
-    [[ ${#marks[@]} -eq 0 ]] && { echo "no files currently marked"; return 0; }
+    [[ ${#tracked_marks[@]} -eq 0 && ${#untracked_marks[@]} -eq 0 ]] \
+        && { echo "no files currently marked"; return 0; }
 
     local found_any=false
-    
-    while IFS= read -r -d '' cand; do
-        local rel_cand
-        rel_cand=$(repo_relative "$cand")
 
-        for mark in "${marks[@]}"; do
-            if [[ "$rel_cand" == "$mark" ]]; then
+    # Unmark tracked files via git ls-files pathspec matching
+    if [[ ${#tracked_marks[@]} -gt 0 ]]; then
+        while IFS= read -r -d '' cand; do
+            local rel_cand
+            rel_cand=$(repo_relative "$cand")
+
+            for mark in "${tracked_marks[@]}"; do
+                if [[ "$rel_cand" == "$mark" ]]; then
+                    drop_entry "$mark"
+                    git update-index --no-skip-worktree -- "$mark" 2>/dev/null || true
+                    printf "${C_YELLOW}unmarked:${C_RST} %s\n" "$mark"
+                    found_any=true
+                    break
+                fi
+            done
+        done < <(git ls-files -z -- "$@")
+    fi
+
+    # Unmark untracked (excluded) files by matching args against paths
+    for mark in ${untracked_marks[@]+"${untracked_marks[@]}"}; do
+        for arg in "$@"; do
+            local rel_arg
+            rel_arg=$(repo_relative "$arg")
+            # Match: exact path, "." (all), or directory prefix
+            if [[ "$mark" == "$rel_arg" || "$rel_arg" == "." || "$mark" == "$rel_arg"/* ]]; then
                 drop_entry "$mark"
-                git update-index --no-skip-worktree -- "$mark" 2>/dev/null || true
-                printf 'unmarked: %s\n' "$mark"
+                exclude_remove "$mark"
+                printf "${C_YELLOW}unmarked:${C_RST} %s\n" "$mark"
                 found_any=true
                 break
             fi
         done
-    done < <(git ls-files -z -- "$@")
+    done
 
     if ! $found_any; then
          printf 'no marked files matched arguments\n'
@@ -418,6 +635,9 @@ do_sync() {
         local p="${paths[$i]}"
         local stored="${hashes[$i]}"
         local full="$REPO_ROOT/$p"
+
+        # Untracked files are hidden via exclude, not skip-worktree
+        [[ "$stored" == "untracked" ]] && continue
 
         if [[ ! -f "$full" ]]; then
             git -C "$REPO_ROOT" update-index --no-skip-worktree -- "$p" 2>/dev/null || true
@@ -468,76 +688,48 @@ cmd_status() {
     init
 
     if global_daemon_running; then
-        printf 'Watcher: \033[32mRUNNING\033[0m (managed by global daemon, PID %s)\n' "$(cat "$GLOBAL_PID")"
-    elif is_running; then
-        printf 'Watcher: \033[32mRUNNING\033[0m (PID %s)\n' "$(cat "$PID_FILE")"
+        printf "Daemon: ${C_GREEN}RUNNING${C_RST} (PID %s)\n" "$(cat "$GLOBAL_PID")"
     else
-        printf 'Watcher: \033[31mSTOPPED\033[0m\n'
+        printf "Daemon: ${C_RED}STOPPED${C_RST}\n"
         if [[ -f "$MARKS_FILE" && -s "$MARKS_FILE" ]]; then
-             printf '(Run "git local watch" or "git local service install" to enable auto-sync)\n'
+             printf "${C_DIM}(Run \"git local service install\" to enable auto-sync)${C_RST}\n"
         fi
     fi
     echo ""
 
     [[ -f "$MARKS_FILE" && -s "$MARKS_FILE" ]] || { echo "no files marked"; return 0; }
 
-    printf '%-45s  %-8s  %s\n' "FILE" "STATE" "HASH"
-    printf '%-45s  %-8s  %s\n' "----" "-----" "----"
+    printf "${C_BOLD}%-45s  %-8s  %s${C_RST}\n" "FILE" "STATE" "HASH"
+    printf "${C_DIM}%-45s  %-8s  %s${C_RST}\n" "----" "-----" "----"
 
     while IFS=' ' read -r stored_hash path || [[ -n "$stored_hash" ]]; do
         [[ -z "$stored_hash" ]] && continue
         local full="$REPO_ROOT/$path"
-        local state
+        local state state_color hash_display
 
-        if [[ ! -f "$full" ]]; then
+        if [[ "$stored_hash" == "untracked" ]]; then
+            state="excluded"
+            state_color="$C_GREEN"
+            hash_display="-"
+        elif [[ ! -f "$full" ]]; then
             state="deleted"
+            state_color="$C_RED"
+            hash_display="${stored_hash:0:8}"
         else
             local current
             current=$(git hash-object "$full")
             if [[ "$current" == "$stored_hash" ]]; then
                 state="hidden"
+                state_color="$C_GREEN"
             else
                 state="changed"
+                state_color="$C_YELLOW"
             fi
+            hash_display="${stored_hash:0:8}"
         fi
 
-        printf '%-45s  %-8s  %s\n' "$path" "$state" "${stored_hash:0:8}"
+        printf "%-45s  ${state_color}%-8s${C_RST}  ${C_DIM}%s${C_RST}\n" "$path" "$state" "$hash_display"
     done < "$MARKS_FILE"
-}
-
-# ── per-repo loop ────────────────────────────────────────────────────────────
-
-cmd_loop() {
-    init
-    
-    if command -v fswatch >/dev/null 2>&1; then
-        printf 'Watching for changes with fswatch...\n'
-        
-        local watch_paths=()
-        if [[ -f "$MARKS_FILE" ]]; then
-            while IFS=' ' read -r _ path || [[ -n "$path" ]]; do
-                [[ -n "$path" ]] && watch_paths+=("$REPO_ROOT/$path")
-            done < "$MARKS_FILE"
-        fi
-        
-        if [[ ${#watch_paths[@]} -eq 0 ]]; then
-            printf 'No files to watch.\n'
-            sleep 3600
-        else
-            fswatch -o -l 1 "${watch_paths[@]}" | while read -r _; do
-                cmd_sync
-            done
-        fi
-    else
-        printf 'fswatch not found. Falling back to polling every 3s.\n'
-        printf '(Install fswatch for better performance: brew install fswatch)\n'
-        
-        local interval=3
-        while true; do
-            sleep "$interval"
-            cmd_sync
-        done
-    fi
 }
 
 # ── global daemon ────────────────────────────────────────────────────────────
@@ -579,8 +771,8 @@ daemon_collect_watch_paths() {
         [[ -z "$repo" || ! -d "$repo/.git" ]] && continue
         local marks="$repo/.git/local-marks"
         [[ -f "$marks" && -s "$marks" ]] || continue
-        while IFS=' ' read -r _ p || [[ -n "$p" ]]; do
-            [[ -n "$p" ]] && DAEMON_WATCH_PATHS+=("$repo/$p")
+        while IFS=' ' read -r h p || [[ -n "$h" ]]; do
+            [[ -n "$p" && "$h" != "untracked" ]] && DAEMON_WATCH_PATHS+=("$repo/$p")
         done < "$marks"
     done < "$GLOBAL_REGISTRY"
 }
@@ -661,7 +853,7 @@ PLIST
 
     launchctl load -w "$LAUNCH_AGENT_PATH"
 
-    printf 'Installed global daemon service.\n'
+    printf "${C_GREEN}Installed global daemon service.${C_RST}\n"
     printf 'LaunchAgent: %s\n' "$LAUNCH_AGENT_PATH"
     printf 'Logs: %s\n' "$GLOBAL_LOG"
     printf '\nRun "git local service" to verify.\n'
@@ -677,27 +869,27 @@ cmd_uninstall_service() {
     rm -f "$LAUNCH_AGENT_PATH"
     rm -f "$GLOBAL_PID"
 
-    printf 'Uninstalled global daemon service.\n'
+    printf "${C_YELLOW}Uninstalled global daemon service.${C_RST}\n"
 }
 
 cmd_service_status() {
     if global_daemon_running; then
-        printf 'Global Daemon: \033[32mRUNNING\033[0m (PID %s)\n' "$(cat "$GLOBAL_PID")"
+        printf "Daemon: ${C_GREEN}RUNNING${C_RST} (PID %s)\n" "$(cat "$GLOBAL_PID")"
     else
-        printf 'Global Daemon: \033[31mSTOPPED\033[0m\n'
+        printf "Daemon: ${C_RED}STOPPED${C_RST}\n"
     fi
 
     if [[ -f "$LAUNCH_AGENT_PATH" ]]; then
-        printf 'LaunchAgent: installed\n'
+        printf "LaunchAgent: ${C_GREEN}installed${C_RST}\n"
     else
-        printf 'LaunchAgent: not installed (run "git local service install")\n'
+        printf "LaunchAgent: ${C_YELLOW}not installed${C_RST} (run \"git local service install\")\n"
     fi
 
     if command -v fswatch >/dev/null 2>&1; then
-        printf 'Watch mode: fswatch (event-driven)\n'
+        printf "Watch mode: ${C_GREEN}fswatch${C_RST} (event-driven)\n"
     else
-        printf 'Watch mode: polling (every 5s)\n'
-        printf '  Install fswatch for instant detection: \033[1mbrew install fswatch\033[0m\n'
+        printf "Watch mode: ${C_YELLOW}polling${C_RST} (every 5s)\n"
+        printf "  Install fswatch for instant detection: ${C_BOLD}brew install fswatch${C_RST}\n"
     fi
     printf 'Logs: %s\n' "$GLOBAL_LOG"
 
@@ -721,15 +913,12 @@ cmd_service_status() {
 
 # ── main ─────────────────────────────────────────────────────────────────────
 
-case "${1:-help}" in
-    mark)   shift; cmd_mark "$@" ;;
+case "${1:-mark}" in
+    mark)   [[ $# -gt 0 ]] && shift; cmd_mark "$@" ;;
+    remark) cmd_remark ;;
     unmark) shift; cmd_unmark "$@" ;;
     sync)   cmd_sync ;;
     status|ls) cmd_status ;;
-    watch)  shift; cmd_watch "$@" ;;
-    stop)   shift; cmd_stop "$@" ;;
-    restart) shift; cmd_restart "$@" ;;
-    loop)   shift; cmd_loop "$@" ;;
     daemon) shift; cmd_daemon "$@" ;;
     service)
         shift
@@ -741,33 +930,30 @@ case "${1:-help}" in
         esac
         ;;
     help|-h|--help)
-        cat <<'USAGE'
+        cat <<USAGE
 usage: git local <command> [args]
 
 commands:
   mark              Interactive mode: select files to hide/show
   mark <spec>...    Mark matching modified files immediately
+  remark            Re-mark all changed files (useful after pull/merge)
   unmark <spec>...  Unmark matching files
   sync              Re-check marked files; reveal any with real changes
   status            List marked files and their current state
-  watch             Start per-repo background watcher (auto-starts on mark)
-  stop              Stop per-repo background watcher
-  restart           Restart per-repo background watcher
 
-global daemon:
-  service           Show global daemon status (alias: service status)
-  service install   Install global daemon (survives reboots)
-  service uninstall Remove global daemon
+daemon:
+  service           Show daemon status (alias: service status)
+  service install   Install daemon as a LaunchAgent (survives reboots)
+  service uninstall Remove daemon
 
 Files are hidden via --skip-worktree as long as their content hash
 matches the snapshot taken at mark time. When the content diverges,
-the watcher detects the mismatch and reveals the file to git.
+the daemon detects the mismatch and reveals the file to git.
 
 After committing real changes, re-run 'mark' to re-hide local edits.
 
-The watcher auto-starts when you mark files and auto-stops
-when all files are unmarked. If the global daemon is installed,
-it manages all repos automatically (including after reboots).
+A single background daemon watches all repos. Install it once with
+'git local service install' and it manages everything automatically.
 USAGE
         ;;
     *)  die "unknown command: $1 (see 'git local help')" ;;
