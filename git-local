@@ -429,7 +429,7 @@ cmd_interactive() {
         printf "${C_BOLD}Select files to hide:${C_RST}\n"
         printf "  ${C_DIM}[Space] toggle  [Enter] confirm  [q] cancel${C_RST}\n"
         printf "  ${C_DIM}[w/↑/s/↓] to move  [a] all  [d] none${C_RST}\n"
-        [[ ${#g_changed[@]} -gt 0 ]] && printf "  ${C_DIM}[r] re-hide changed files${C_RST}\n"
+        [[ ${#g_changed[@]} -gt 0 ]] && printf "  ${C_DIM}[r] re-hide revealed files${C_RST}\n"
         echo ""
 
         for ((i=0; i<total; i++)); do
@@ -478,7 +478,7 @@ cmd_interactive() {
                     [[ -n "${candidates[$ii]}" ]] && selected[$ii]=x
                 done
                 ;;
-            "d") # Deselect all (skip sentinels)
+            "d"|"n") # Deselect all (skip sentinels)
                 for ((ii=0; ii<total; ii++)); do
                     [[ -n "${candidates[$ii]}" ]] && selected[$ii]=" "
                 done
@@ -550,10 +550,10 @@ cmd_interactive() {
     done
 }
 
-# ── unhide ───────────────────────────────────────────────────────────────────
+# ── show ───────────────────────────────────────────────────────────────────
 
-cmd_unhide() {
-    [[ $# -eq 0 ]] && die "usage: git local unhide <pathspec>... (e.g. . or *)"
+cmd_show() {
+    [[ $# -eq 0 ]] && die "usage: git local show <pathspec>... (e.g. src/file.txt or .)"
     init
 
     [[ -f "$HIDDEN_FILE" && -s "$HIDDEN_FILE" ]] \
@@ -889,11 +889,14 @@ cmd_service_status() {
         printf "LaunchAgent: ${C_YELLOW}not installed${C_RST} (run \"git local service install\")\n"
     fi
 
-    if command -v fswatch >/dev/null 2>&1; then
-        printf "Watch mode: ${C_GREEN}fswatch${C_RST} (event-driven)\n"
-    else
-        printf "Watch mode: ${C_YELLOW}polling${C_RST} (every 5s)\n"
-        printf "  Install fswatch for instant detection: ${C_BOLD}brew install fswatch${C_RST}\n"
+    if [[ -f "$LAUNCH_AGENT_PATH" ]] || global_daemon_running; then
+        if command -v fswatch >/dev/null 2>&1; then
+            printf "Watch mode: ${C_GREEN}fswatch${C_RST} (event-driven)\n"
+        else
+            printf "Watch mode: ${C_YELLOW}polling${C_RST} (every 5s)\n"
+            printf "  For instant detection: ${C_BOLD}brew install fswatch${C_RST}\n"
+            printf "  Then reinstall the service: ${C_BOLD}git local service uninstall && git local service install${C_RST}\n"
+        fi
     fi
     printf 'Logs: %s\n' "$GLOBAL_LOG"
 
@@ -915,12 +918,34 @@ cmd_service_status() {
     fi
 }
 
+# ── reset ─────────────────────────────────────────────────────────────────────
+
+cmd_reset() {
+    init
+    [[ -f "$HIDDEN_FILE" && -s "$HIDDEN_FILE" ]] \
+        || { echo "no files currently hidden"; return 0; }
+
+    while IFS=' ' read -r hash path || [[ -n "$hash" ]]; do
+        [[ -z "$hash" || -z "$path" ]] && continue
+        if [[ "$hash" == "untracked" ]]; then
+            exclude_remove "$path"
+        else
+            git update-index --no-skip-worktree -- "$path" 2>/dev/null || true
+        fi
+        printf "${C_YELLOW}unhidden:${C_RST} %s\n" "$path"
+    done < "$HIDDEN_FILE"
+
+    rm -f "$HIDDEN_FILE"
+    notify_watcher
+}
+
 # ── main ─────────────────────────────────────────────────────────────────────
 
 case "${1:-hide}" in
     hide)   [[ $# -gt 0 ]] && shift; cmd_hide "$@" ;;
     rehide) cmd_rehide ;;
-    unhide) shift; cmd_unhide "$@" ;;
+    show|unhide) shift; cmd_show "$@" ;;
+    reset)  cmd_reset ;;
     sync)   cmd_sync ;;
     status|ls) cmd_status ;;
     daemon) shift; cmd_daemon "$@" ;;
@@ -929,35 +954,37 @@ case "${1:-hide}" in
         case "${1:-status}" in
             install)   cmd_install_service ;;
             uninstall) cmd_uninstall_service ;;
+            logs)      exec tail -f "$GLOBAL_LOG" ;;
             status)    cmd_service_status ;;
-            *)         die "unknown service command: $1 (try install, uninstall, status)" ;;
+            *)         die "unknown service command: $1 (try install, uninstall, logs, status)" ;;
         esac
         ;;
     help|-h|--help)
         cat <<USAGE
-usage: git local <command> [args]
+Temporarily hide files from git. Hidden files are content-aware:
+they automatically reappear when their contents change.
+
+usage: git local [command] [args]
+
+Run 'git local' with no arguments to open the interactive UI.
 
 commands:
-  hide              Interactive mode: select files to hide/show
-  hide <spec>...    Hide matching modified files immediately
-  rehide            Re-hide all changed files (useful after pull/merge)
-  unhide <spec>...  Unhide matching files
-  sync              Re-check hidden files; reveal any with real changes
-  status            List hidden files and their current state
+  hide <spec>...    Hide matching files from git
+  show <spec>...    Unhide matching files
+  rehide            Re-hide revealed files with updated snapshots
+  reset             Unhide all files
+  status            List hidden files and their state
+  sync              Re-check hidden files (the daemon does this automatically)
 
 daemon:
-  service           Show daemon status (alias: service status)
-  service install   Install daemon as a LaunchAgent (survives reboots)
+  service           Show daemon status
+  service install   Install as a LaunchAgent (survives reboots)
   service uninstall Remove daemon
+  service logs      Tail daemon log
 
-Tracked files are hidden via --skip-worktree. When the content hash
-diverges from the snapshot taken at hide time, the daemon reveals
-the file to git. Untracked files are hidden via .git/info/exclude.
-
-After committing real changes, re-run 'hide' to re-hide local edits.
-
-A single background daemon watches all repos. Install it once with
-'git local service install' and it manages everything automatically.
+When you hide a file, git-local snapshots its content. If the file
+changes, the daemon automatically reveals it to git so you don't miss
+real changes. After committing, run 'rehide' to re-hide local edits.
 USAGE
         ;;
     *)  die "unknown command: $1 (see 'git local help')" ;;
