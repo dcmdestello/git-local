@@ -308,7 +308,7 @@ cmd_interactive() {
     }
 
     # Temporary per-group arrays (each entry is "idx" into the parallel arrays)
-    local g_changed=() g_modified=() g_untracked=() g_hidden=()
+    local g_changed=() g_modified=() g_untracked=() g_hidden_tracked=() g_hidden_untracked=()
 
     # ── Collect marked files (split into changed or hidden) ──
     if [[ -f "$MARKS_FILE" ]]; then
@@ -320,7 +320,7 @@ cmd_interactive() {
             # Untracked files hidden via exclude — show in hidden group
             if [[ "$stored_hash" == "untracked" ]]; then
                 if [[ -f "$REPO_ROOT/$path" ]]; then
-                    g_hidden+=("$path|true|false|true|$path ${C_GREEN}(hidden, untracked)${C_RST}|x")
+                    g_hidden_untracked+=("$path|true|false|true|$path ${C_GREEN}(hidden, untracked)${C_RST}|x")
                 else
                     # File deleted, auto-clean
                     drop_entry "$path"
@@ -339,7 +339,7 @@ cmd_interactive() {
             local current_hash
             current_hash=$(git hash-object "$REPO_ROOT/$path")
             if [[ "$current_hash" == "$stored_hash" ]]; then
-                g_hidden+=("$path|true|false|false|$path ${C_GREEN}(hidden)${C_RST}|x")
+                g_hidden_tracked+=("$path|true|false|false|$path ${C_GREEN}(hidden)${C_RST}|x")
             else
                 g_changed+=("$path|true|true|false|$path ${C_YELLOW}(changed)${C_RST}|-")
             fi
@@ -374,16 +374,18 @@ cmd_interactive() {
         done
     }
 
-    local first_group=true
-    for group_name in g_changed g_modified g_untracked g_hidden; do
+    local first_group=true prev_group=""
+    for group_name in g_changed g_modified g_hidden_tracked g_untracked g_hidden_untracked; do
         eval "local group_size=\${#${group_name}[@]}"
         [[ $group_size -eq 0 ]] && continue
         if $first_group; then
             first_group=false
-        else
+        elif [[ "$prev_group:$group_name" != "g_modified:g_hidden_tracked" && \
+                "$prev_group:$group_name" != "g_untracked:g_hidden_untracked" ]]; then
             _add_separator
         fi
         eval '_unpack_group "${'"$group_name"'[@]}"'
+        prev_group=$group_name
     done
 
     if [[ ${#candidates[@]} -eq 0 ]]; then
@@ -426,7 +428,8 @@ cmd_interactive() {
 
         printf "${C_BOLD}Select files to mark (hide from git):${C_RST}\n"
         printf "  ${C_DIM}[Space] toggle  [Enter] confirm  [q] cancel${C_RST}\n"
-        printf "  ${C_DIM}[w/s] or [Up/Down] to move${C_RST}\n"
+        printf "  ${C_DIM}[w/↑/s/↓] to move  [a] all  [d] none${C_RST}\n"
+        [[ ${#g_changed[@]} -gt 0 ]] && printf "  ${C_DIM}[r] re-hide changed files${C_RST}\n"
         echo ""
 
         for ((i=0; i<total; i++)); do
@@ -475,7 +478,7 @@ cmd_interactive() {
                     [[ -n "${candidates[$ii]}" ]] && selected[$ii]=x
                 done
                 ;;
-            "n") # Deselect all (skip sentinels)
+            "d") # Deselect all (skip sentinels)
                 for ((ii=0; ii<total; ii++)); do
                     [[ -n "${candidates[$ii]}" ]] && selected[$ii]=" "
                 done
