@@ -24,14 +24,14 @@ die() { printf "${C_RED}git-local: %s${C_RST}\n" "$*" >&2; exit 1; }
 init() {
     GIT_DIR=$(git rev-parse --git-dir 2>/dev/null) || die "not in a git repository"
     REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || die "cannot find repo root"
-    MARKS_FILE="$GIT_DIR/local-marks"
+    HIDDEN_FILE="$GIT_DIR/local-hidden"
 }
 
 init_for_repo() {
     REPO_ROOT="$1"
     GIT_DIR="$REPO_ROOT/.git"
     [[ -d "$GIT_DIR" ]] || return 1
-    MARKS_FILE="$GIT_DIR/local-marks"
+    HIDDEN_FILE="$GIT_DIR/local-hidden"
 }
 
 # Resolve a path (relative to cwd or absolute) to repo-root-relative
@@ -103,18 +103,18 @@ exclude_remove() {
     _excl_write
 }
 
-# ── marks helpers ────────────────────────────────────────────────────────────
+# ── hidden helpers ────────────────────────────────────────────────────────────
 
-# Remove a path's entry from the marks file
+# Remove a path's entry from the hidden file
 drop_entry() {
     local target="$1"
-    [[ -f "$MARKS_FILE" ]] || return 0
-    local tmp="$MARKS_FILE.tmp"
+    [[ -f "$HIDDEN_FILE" ]] || return 0
+    local tmp="$HIDDEN_FILE.tmp"
     while IFS= read -r line || [[ -n "$line" ]]; do
         [[ -z "$line" ]] && continue
         [[ "${line#* }" != "$target" ]] && printf '%s\n' "$line"
-    done < "$MARKS_FILE" > "$tmp"
-    mv "$tmp" "$MARKS_FILE"
+    done < "$HIDDEN_FILE" > "$tmp"
+    mv "$tmp" "$HIDDEN_FILE"
 }
 
 
@@ -153,9 +153,9 @@ signal_daemon() {
     kill -HUP "$(cat "$GLOBAL_PID")" 2>/dev/null || true
 }
 
-# Called after marks change to keep the daemon in sync
+# Called after hidden list changes to keep the daemon in sync
 notify_watcher() {
-    if [[ -s "$MARKS_FILE" ]]; then
+    if [[ -s "$HIDDEN_FILE" ]]; then
         registry_add "$REPO_ROOT"
     else
         registry_remove "$REPO_ROOT"
@@ -167,9 +167,9 @@ notify_watcher() {
     fi
 }
 
-# ── mark ─────────────────────────────────────────────────────────────────────
+# ── hide ─────────────────────────────────────────────────────────────────────
 
-cmd_mark() {
+cmd_hide() {
     init
     if [[ $# -eq 0 ]]; then
         cmd_interactive
@@ -202,10 +202,10 @@ cmd_mark() {
         hash=$(git hash-object "$REPO_ROOT/$rel")
 
         drop_entry "$rel"
-        printf '%s %s\n' "$hash" "$rel" >> "$MARKS_FILE"
+        printf '%s %s\n' "$hash" "$rel" >> "$HIDDEN_FILE"
         git update-index --skip-worktree -- "$rel"
 
-        printf "${C_GREEN}marked:${C_RST} %s ${C_DIM}(%s)${C_RST}\n" "$rel" "${hash:0:8}"
+        printf "${C_GREEN}hidden:${C_RST} %s ${C_DIM}(%s)${C_RST}\n" "$rel" "${hash:0:8}"
     done
 
     for file in ${untracked[@]+"${untracked[@]}"}; do
@@ -214,19 +214,19 @@ cmd_mark() {
 
         exclude_add "$rel"
         drop_entry "$rel"
-        printf '%s %s\n' "untracked" "$rel" >> "$MARKS_FILE"
+        printf '%s %s\n' "untracked" "$rel" >> "$HIDDEN_FILE"
 
-        printf "${C_GREEN}marked:${C_RST} %s ${C_DIM}(untracked)${C_RST}\n" "$rel"
+        printf "${C_GREEN}hidden:${C_RST} %s ${C_DIM}(untracked)${C_RST}\n" "$rel"
     done
 
     notify_watcher
 }
 
-cmd_remark() {
+cmd_rehide() {
     init
-    [[ -f "$MARKS_FILE" && -s "$MARKS_FILE" ]] || { echo "no files marked"; return 0; }
+    [[ -f "$HIDDEN_FILE" && -s "$HIDDEN_FILE" ]] || { echo "no files hidden"; return 0; }
 
-    local new_marks=() remarked=0 unchanged=0
+    local new_entries=() rehidden=0 unchanged=0
 
     while IFS=' ' read -r stored_hash path || [[ -n "$stored_hash" ]]; do
         [[ -z "$stored_hash" || -z "$path" ]] && continue
@@ -234,7 +234,7 @@ cmd_remark() {
         # Untracked files: keep if still present, clean up if deleted
         if [[ "$stored_hash" == "untracked" ]]; then
             if [[ -f "$REPO_ROOT/$path" ]]; then
-                new_marks+=("untracked $path")
+                new_entries+=("untracked $path")
                 ((unchanged++)) || true
             else
                 exclude_remove "$path"
@@ -252,22 +252,22 @@ cmd_remark() {
         current=$(git hash-object "$REPO_ROOT/$path")
 
         if [[ "$current" != "$stored_hash" ]]; then
-            new_marks+=("$current $path")
+            new_entries+=("$current $path")
             git update-index --skip-worktree -- "$path" 2>/dev/null || true
-            printf "${C_CYAN}re-marked:${C_RST} %s\n" "$path"
-            ((remarked++)) || true
+            printf "${C_CYAN}re-hidden:${C_RST} %s\n" "$path"
+            ((rehidden++)) || true
         else
-            new_marks+=("$stored_hash $path")
+            new_entries+=("$stored_hash $path")
             ((unchanged++)) || true
         fi
-    done < "$MARKS_FILE"
+    done < "$HIDDEN_FILE"
 
-    # Rewrite marks file
-    local tmp="$MARKS_FILE.tmp"
-    printf '%s\n' ${new_marks[@]+"${new_marks[@]}"} > "$tmp"
-    mv "$tmp" "$MARKS_FILE"
+    # Rewrite hidden file
+    local tmp="$HIDDEN_FILE.tmp"
+    printf '%s\n' ${new_entries[@]+"${new_entries[@]}"} > "$tmp"
+    mv "$tmp" "$HIDDEN_FILE"
 
-    if [[ $remarked -eq 0 ]]; then
+    if [[ $rehidden -eq 0 ]]; then
         printf 'all %s files already up to date\n' "$unchanged"
     else
         [[ $unchanged -gt 0 ]] && printf "${C_DIM}%s files unchanged${C_RST}\n" "$unchanged"
@@ -279,14 +279,14 @@ cmd_remark() {
 # ── interactive ──────────────────────────────────────────────────────────────
 
 cmd_interactive() {
-    # Collect into groups, then merge: changed → modified → untracked → hidden
+    # Collect into groups, then merge: changed → modified → hidden → untracked
     # Sentinel entries (empty candidate) act as visual separators.
 
     local seen=()
     local candidates=()
     local display_names=()
     local selected=()
-    local is_marked=()
+    local is_hidden=()
     local is_changed=()
     local is_untracked=()
 
@@ -302,7 +302,7 @@ cmd_interactive() {
         candidates+=("")
         display_names+=("")
         selected+=(" ")
-        is_marked+=(false)
+        is_hidden+=(false)
         is_changed+=(false)
         is_untracked+=(false)
     }
@@ -310,8 +310,8 @@ cmd_interactive() {
     # Temporary per-group arrays (each entry is "idx" into the parallel arrays)
     local g_changed=() g_modified=() g_untracked=() g_hidden_tracked=() g_hidden_untracked=()
 
-    # ── Collect marked files (split into changed or hidden) ──
-    if [[ -f "$MARKS_FILE" ]]; then
+    # ── Collect hidden files (split into changed or hidden) ──
+    if [[ -f "$HIDDEN_FILE" ]]; then
         while IFS=' ' read -r stored_hash path || [[ -n "$stored_hash" ]]; do
             [[ -z "$stored_hash" || -z "$path" ]] && continue
             _seen "$path" && continue
@@ -343,7 +343,7 @@ cmd_interactive() {
             else
                 g_changed+=("$path|true|true|false|$path ${C_YELLOW}(changed)${C_RST}|-")
             fi
-        done < "$MARKS_FILE"
+        done < "$HIDDEN_FILE"
     fi
 
     # ── Collect modified files ──
@@ -366,7 +366,7 @@ cmd_interactive() {
             local IFS='|'
             read -r _p _m _c _u _d _s <<< "$entry"
             candidates+=("$_p")
-            is_marked+=("$_m")
+            is_hidden+=("$_m")
             is_changed+=("$_c")
             is_untracked+=("$_u")
             display_names+=("$_d")
@@ -389,7 +389,7 @@ cmd_interactive() {
     done
 
     if [[ ${#candidates[@]} -eq 0 ]]; then
-        echo "No modified, untracked, or marked files found."
+        echo "No modified, untracked, or hidden files found."
         return 0
     fi
 
@@ -426,7 +426,7 @@ cmd_interactive() {
     while true; do
         printf '\033[2J\033[H'
 
-        printf "${C_BOLD}Select files to mark (hide from git):${C_RST}\n"
+        printf "${C_BOLD}Select files to hide:${C_RST}\n"
         printf "  ${C_DIM}[Space] toggle  [Enter] confirm  [q] cancel${C_RST}\n"
         printf "  ${C_DIM}[w/↑/s/↓] to move  [a] all  [d] none${C_RST}\n"
         [[ ${#g_changed[@]} -gt 0 ]] && printf "  ${C_DIM}[r] re-hide changed files${C_RST}\n"
@@ -483,7 +483,7 @@ cmd_interactive() {
                     [[ -n "${candidates[$ii]}" ]] && selected[$ii]=" "
                 done
                 ;;
-            "r") # Remark all changed: [-] → [x]
+            "r") # Rehide all changed: [-] → [x]
                 for ((ii=0; ii<total; ii++)); do
                     [[ "${selected[$ii]}" == "-" ]] && selected[$ii]=x
                 done
@@ -508,80 +508,80 @@ cmd_interactive() {
         [[ -z "$path" ]] && continue  # skip sentinels
 
         local sel="${selected[$i]}"
-        local was_marked="${is_marked[$i]}"
+        local was_hidden="${is_hidden[$i]}"
         local changed="${is_changed[$i]}"
         local untracked="${is_untracked[$i]}"
 
         # [-] = leave as-is, no action
         [[ "$sel" == "-" ]] && continue
 
-        if [[ "$sel" == "x" ]] && [[ "$was_marked" != "true" ]]; then
-            # New mark
+        if [[ "$sel" == "x" ]] && [[ "$was_hidden" != "true" ]]; then
+            # New hide
             if [[ "$untracked" == "true" ]]; then
                 exclude_add "$path"
                 drop_entry "$path"
-                printf '%s %s\n' "untracked" "$path" >> "$MARKS_FILE"
+                printf '%s %s\n' "untracked" "$path" >> "$HIDDEN_FILE"
             else
                 local hash
                 hash=$(git hash-object "$REPO_ROOT/$path")
                 drop_entry "$path"
-                printf '%s %s\n' "$hash" "$path" >> "$MARKS_FILE"
+                printf '%s %s\n' "$hash" "$path" >> "$HIDDEN_FILE"
                 git update-index --skip-worktree -- "$path"
             fi
-            printf "${C_GREEN}marked:${C_RST} %s\n" "$path"
-        elif [[ "$sel" == "x" ]] && [[ "$was_marked" == "true" ]] && [[ "$changed" == "true" ]]; then
-            # Re-mark with updated hash
+            printf "${C_GREEN}hidden:${C_RST} %s\n" "$path"
+        elif [[ "$sel" == "x" ]] && [[ "$was_hidden" == "true" ]] && [[ "$changed" == "true" ]]; then
+            # Re-hide with updated hash
             local hash
             hash=$(git hash-object "$REPO_ROOT/$path")
             drop_entry "$path"
-            printf '%s %s\n' "$hash" "$path" >> "$MARKS_FILE"
+            printf '%s %s\n' "$hash" "$path" >> "$HIDDEN_FILE"
             git update-index --skip-worktree -- "$path" 2>/dev/null || true
-            printf "${C_CYAN}re-marked:${C_RST} %s\n" "$path"
-        elif [[ "$sel" == " " ]] && [[ "$was_marked" == "true" ]]; then
-            # Unmark
+            printf "${C_CYAN}re-hidden:${C_RST} %s\n" "$path"
+        elif [[ "$sel" == " " ]] && [[ "$was_hidden" == "true" ]]; then
+            # Unhide
             drop_entry "$path"
             if [[ "$untracked" == "true" ]]; then
                 exclude_remove "$path"
             else
                 git update-index --no-skip-worktree -- "$path" 2>/dev/null || true
             fi
-            printf "${C_YELLOW}unmarked:${C_RST} %s\n" "$path"
+            printf "${C_YELLOW}unhidden:${C_RST} %s\n" "$path"
         fi
     done
 }
 
-# ── unmark ───────────────────────────────────────────────────────────────────
+# ── unhide ───────────────────────────────────────────────────────────────────
 
-cmd_unmark() {
-    [[ $# -eq 0 ]] && die "usage: git local unmark <pathspec>... (e.g. . or *)"
+cmd_unhide() {
+    [[ $# -eq 0 ]] && die "usage: git local unhide <pathspec>... (e.g. . or *)"
     init
 
-    [[ -f "$MARKS_FILE" && -s "$MARKS_FILE" ]] \
-        || { echo "no files currently marked"; return 0; }
+    [[ -f "$HIDDEN_FILE" && -s "$HIDDEN_FILE" ]] \
+        || { echo "no files currently hidden"; return 0; }
 
-    local tracked_marks=() untracked_marks=()
+    local tracked_hidden=() untracked_hidden=()
     while IFS=' ' read -r hash path || [[ -n "$hash" ]]; do
         [[ -z "$hash" || -z "$path" ]] && continue
         if [[ "$hash" == "untracked" ]]; then
-            untracked_marks+=("$path")
+            untracked_hidden+=("$path")
         else
-            tracked_marks+=("$path")
+            tracked_hidden+=("$path")
         fi
-    done < "$MARKS_FILE"
+    done < "$HIDDEN_FILE"
 
     local found_any=false
 
-    # Unmark tracked files via git ls-files pathspec matching
-    if [[ ${#tracked_marks[@]} -gt 0 ]]; then
+    # Unhide tracked files via git ls-files pathspec matching
+    if [[ ${#tracked_hidden[@]} -gt 0 ]]; then
         while IFS= read -r -d '' cand; do
             local rel_cand
             rel_cand=$(repo_relative "$cand")
 
-            for mark in "${tracked_marks[@]}"; do
-                if [[ "$rel_cand" == "$mark" ]]; then
-                    drop_entry "$mark"
-                    git update-index --no-skip-worktree -- "$mark" 2>/dev/null || true
-                    printf "${C_YELLOW}unmarked:${C_RST} %s\n" "$mark"
+            for entry in "${tracked_hidden[@]}"; do
+                if [[ "$rel_cand" == "$entry" ]]; then
+                    drop_entry "$entry"
+                    git update-index --no-skip-worktree -- "$entry" 2>/dev/null || true
+                    printf "${C_YELLOW}unhidden:${C_RST} %s\n" "$entry"
                     found_any=true
                     break
                 fi
@@ -589,16 +589,16 @@ cmd_unmark() {
         done < <(git ls-files -z -- "$@")
     fi
 
-    # Unmark untracked (excluded) files by matching args against paths
-    for mark in ${untracked_marks[@]+"${untracked_marks[@]}"}; do
+    # Unhide untracked (excluded) files by matching args against paths
+    for entry in ${untracked_hidden[@]+"${untracked_hidden[@]}"}; do
         for arg in "$@"; do
             local rel_arg
             rel_arg=$(repo_relative "$arg")
             # Match: exact path, "." (all), or directory prefix
-            if [[ "$mark" == "$rel_arg" || "$rel_arg" == "." || "$mark" == "$rel_arg"/* ]]; then
-                drop_entry "$mark"
-                exclude_remove "$mark"
-                printf "${C_YELLOW}unmarked:${C_RST} %s\n" "$mark"
+            if [[ "$entry" == "$rel_arg" || "$rel_arg" == "." || "$entry" == "$rel_arg"/* ]]; then
+                drop_entry "$entry"
+                exclude_remove "$entry"
+                printf "${C_YELLOW}unhidden:${C_RST} %s\n" "$entry"
                 found_any=true
                 break
             fi
@@ -606,7 +606,7 @@ cmd_unmark() {
     done
 
     if ! $found_any; then
-         printf 'no marked files matched arguments\n'
+         printf 'no hidden files matched arguments\n'
     fi
 
     notify_watcher
@@ -614,10 +614,10 @@ cmd_unmark() {
 
 # ── sync ─────────────────────────────────────────────────────────────────────
 
-# Core sync logic — uses REPO_ROOT/MARKS_FILE set by init or init_for_repo.
+# Core sync logic — uses REPO_ROOT/HIDDEN_FILE set by init or init_for_repo.
 # All git commands use -C to work without requiring cwd to be in the repo.
 do_sync() {
-    [[ -f "$MARKS_FILE" && -s "$MARKS_FILE" ]] || return 0
+    [[ -f "$HIDDEN_FILE" && -s "$HIDDEN_FILE" ]] || return 0
 
     local hashes=() paths=() dirty=false
 
@@ -625,7 +625,7 @@ do_sync() {
         [[ -z "$h" ]] && continue
         hashes+=("$h")
         paths+=("$p")
-    done < "$MARKS_FILE"
+    done < "$HIDDEN_FILE"
 
     for i in "${!paths[@]}"; do
         local p="${paths[$i]}"
@@ -673,11 +673,11 @@ do_sync() {
     done
 
     if $dirty; then
-        local tmp="$MARKS_FILE.tmp"
+        local tmp="$HIDDEN_FILE.tmp"
         for i in "${!paths[@]}"; do
             [[ -n "${paths[$i]}" ]] && printf '%s %s\n' "${hashes[$i]}" "${paths[$i]}"
         done > "$tmp"
-        mv "$tmp" "$MARKS_FILE"
+        mv "$tmp" "$HIDDEN_FILE"
     fi
 }
 
@@ -695,13 +695,13 @@ cmd_status() {
         printf "Daemon: ${C_GREEN}RUNNING${C_RST} (PID %s)\n" "$(cat "$GLOBAL_PID")"
     else
         printf "Daemon: ${C_RED}STOPPED${C_RST}\n"
-        if [[ -f "$MARKS_FILE" && -s "$MARKS_FILE" ]]; then
+        if [[ -f "$HIDDEN_FILE" && -s "$HIDDEN_FILE" ]]; then
              printf "${C_DIM}(Run \"git local service install\" to enable auto-sync)${C_RST}\n"
         fi
     fi
     echo ""
 
-    [[ -f "$MARKS_FILE" && -s "$MARKS_FILE" ]] || { echo "no files marked"; return 0; }
+    [[ -f "$HIDDEN_FILE" && -s "$HIDDEN_FILE" ]] || { echo "no files hidden"; return 0; }
 
     printf "${C_BOLD}%-45s  %-18s  %s${C_RST}\n" "FILE" "STATE" "HASH"
     printf "${C_DIM}%-45s  %-18s  %s${C_RST}\n" "----" "-----" "----"
@@ -733,7 +733,7 @@ cmd_status() {
         fi
 
         printf "%-45s  ${state_color}%-18s${C_RST}  ${C_DIM}%s${C_RST}\n" "$path" "$state" "$hash_display"
-    done < "$MARKS_FILE"
+    done < "$HIDDEN_FILE"
 }
 
 # ── global daemon ────────────────────────────────────────────────────────────
@@ -750,7 +750,7 @@ daemon_sync_all() {
             continue
         fi
 
-        if [[ ! -f "$MARKS_FILE" || ! -s "$MARKS_FILE" ]]; then
+        if [[ ! -f "$HIDDEN_FILE" || ! -s "$HIDDEN_FILE" ]]; then
             stale_repos+=("$repo")
             continue
         fi
@@ -766,18 +766,18 @@ daemon_sync_all() {
     fi
 }
 
-# Collect full paths of all marked files across all repos
+# Collect full paths of all hidden files across all repos
 daemon_collect_watch_paths() {
     DAEMON_WATCH_PATHS=()
     [[ -f "$GLOBAL_REGISTRY" ]] || return 0
 
     while IFS= read -r repo || [[ -n "$repo" ]]; do
         [[ -z "$repo" || ! -d "$repo/.git" ]] && continue
-        local marks="$repo/.git/local-marks"
-        [[ -f "$marks" && -s "$marks" ]] || continue
+        local hfile="$repo/.git/local-hidden"
+        [[ -f "$hfile" && -s "$hfile" ]] || continue
         while IFS=' ' read -r h p || [[ -n "$h" ]]; do
             [[ -n "$p" && "$h" != "untracked" ]] && DAEMON_WATCH_PATHS+=("$repo/$p")
-        done < "$marks"
+        done < "$hfile"
     done < "$GLOBAL_REGISTRY"
 }
 
@@ -903,12 +903,12 @@ cmd_service_status() {
         printf '\nRegistered repos (%s):\n' "$count"
         while IFS= read -r repo; do
             [[ -z "$repo" ]] && continue
-            local marks_count=0
-            local marks_file="$repo/.git/local-marks"
-            if [[ -f "$marks_file" && -s "$marks_file" ]]; then
-                marks_count=$(wc -l < "$marks_file" | tr -d ' ')
+            local hidden_count=0
+            local hidden_file="$repo/.git/local-hidden"
+            if [[ -f "$hidden_file" && -s "$hidden_file" ]]; then
+                hidden_count=$(wc -l < "$hidden_file" | tr -d ' ')
             fi
-            printf '  %s (%s files)\n' "$repo" "$marks_count"
+            printf '  %s (%s files)\n' "$repo" "$hidden_count"
         done < "$GLOBAL_REGISTRY"
     else
         printf '\nNo repos registered.\n'
@@ -917,10 +917,10 @@ cmd_service_status() {
 
 # ── main ─────────────────────────────────────────────────────────────────────
 
-case "${1:-mark}" in
-    mark)   [[ $# -gt 0 ]] && shift; cmd_mark "$@" ;;
-    remark) cmd_remark ;;
-    unmark) shift; cmd_unmark "$@" ;;
+case "${1:-hide}" in
+    hide)   [[ $# -gt 0 ]] && shift; cmd_hide "$@" ;;
+    rehide) cmd_rehide ;;
+    unhide) shift; cmd_unhide "$@" ;;
     sync)   cmd_sync ;;
     status|ls) cmd_status ;;
     daemon) shift; cmd_daemon "$@" ;;
@@ -938,12 +938,12 @@ case "${1:-mark}" in
 usage: git local <command> [args]
 
 commands:
-  mark              Interactive mode: select files to hide/show
-  mark <spec>...    Mark matching modified files immediately
-  remark            Re-mark all changed files (useful after pull/merge)
-  unmark <spec>...  Unmark matching files
-  sync              Re-check marked files; reveal any with real changes
-  status            List marked files and their current state
+  hide              Interactive mode: select files to hide/show
+  hide <spec>...    Hide matching modified files immediately
+  rehide            Re-hide all changed files (useful after pull/merge)
+  unhide <spec>...  Unhide matching files
+  sync              Re-check hidden files; reveal any with real changes
+  status            List hidden files and their current state
 
 daemon:
   service           Show daemon status (alias: service status)
@@ -951,10 +951,10 @@ daemon:
   service uninstall Remove daemon
 
 Tracked files are hidden via --skip-worktree. When the content hash
-diverges from the snapshot taken at mark time, the daemon reveals
+diverges from the snapshot taken at hide time, the daemon reveals
 the file to git. Untracked files are hidden via .git/info/exclude.
 
-After committing real changes, re-run 'mark' to re-hide local edits.
+After committing real changes, re-run 'hide' to re-hide local edits.
 
 A single background daemon watches all repos. Install it once with
 'git local service install' and it manages everything automatically.
