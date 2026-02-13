@@ -46,36 +46,26 @@ repo_relative() {
 _EXCL_BEGIN="# git-local begin"
 _EXCL_END="# git-local end"
 
-# Read current git-local exclude entries into an array
+# Read the exclude file, splitting into our entries and everything else
 _excl_read() {
     _EXCL_ENTRIES=()
+    _EXCL_OTHER=()
     local exclude="$GIT_DIR/info/exclude"
     [[ -f "$exclude" ]] || return 0
     local in_block=false
-    while IFS= read -r line; do
+    while IFS= read -r line || [[ -n "$line" ]]; do
         if [[ "$line" == "$_EXCL_BEGIN" ]]; then in_block=true; continue; fi
         if [[ "$line" == "$_EXCL_END" ]]; then in_block=false; continue; fi
-        if $in_block; then _EXCL_ENTRIES+=("$line"); fi
+        if $in_block; then _EXCL_ENTRIES+=("$line"); else _EXCL_OTHER+=("$line"); fi
     done < "$exclude"
 }
 
-# Rewrite the exclude file with the given entries
+# Rewrite the exclude file from _EXCL_OTHER + _EXCL_ENTRIES
 _excl_write() {
     local exclude="$GIT_DIR/info/exclude"
     mkdir -p "$GIT_DIR/info"
-    # Read lines outside our block
-    local other_lines=()
-    if [[ -f "$exclude" ]]; then
-        local in_block=false
-        while IFS= read -r line || [[ -n "$line" ]]; do
-            if [[ "$line" == "$_EXCL_BEGIN" ]]; then in_block=true; continue; fi
-            if [[ "$line" == "$_EXCL_END" ]]; then in_block=false; continue; fi
-            if ! $in_block; then other_lines+=("$line"); fi
-        done < "$exclude"
-    fi
-    # Write back other lines + our block
     local tmp="$exclude.tmp"
-    for line in ${other_lines[@]+"${other_lines[@]}"}; do
+    for line in ${_EXCL_OTHER[@]+"${_EXCL_OTHER[@]}"}; do
         printf '%s\n' "$line"
     done > "$tmp"
     if [[ ${#_EXCL_ENTRIES[@]} -gt 0 ]]; then
@@ -127,18 +117,6 @@ drop_entry() {
     mv "$tmp" "$MARKS_FILE"
 }
 
-# Print the stored hash for a path (empty string if not found)
-stored_hash_for() {
-    local target="$1"
-    [[ -f "$MARKS_FILE" ]] || return 0
-    while IFS=' ' read -r hash path || [[ -n "$hash" ]]; do
-        [[ -z "$hash" ]] && continue
-        if [[ "$path" == "$target" ]]; then
-            printf '%s' "$hash"
-            return 0
-        fi
-    done < "$MARKS_FILE"
-}
 
 # ── registry ─────────────────────────────────────────────────────────────────
 
@@ -253,10 +231,15 @@ cmd_remark() {
     while IFS=' ' read -r stored_hash path || [[ -n "$stored_hash" ]]; do
         [[ -z "$stored_hash" || -z "$path" ]] && continue
 
-        # Untracked files are hidden via exclude, no hash to update
+        # Untracked files: keep if still present, clean up if deleted
         if [[ "$stored_hash" == "untracked" ]]; then
-            new_marks+=("untracked $path")
-            ((unchanged++)) || true
+            if [[ -f "$REPO_ROOT/$path" ]]; then
+                new_marks+=("untracked $path")
+                ((unchanged++)) || true
+            else
+                exclude_remove "$path"
+                printf "${C_DIM}removed: %s (deleted)${C_RST}\n" "$path"
+            fi
             continue
         fi
 
@@ -281,7 +264,7 @@ cmd_remark() {
 
     # Rewrite marks file
     local tmp="$MARKS_FILE.tmp"
-    printf '%s\n' "${new_marks[@]}" > "$tmp"
+    printf '%s\n' ${new_marks[@]+"${new_marks[@]}"} > "$tmp"
     mv "$tmp" "$MARKS_FILE"
 
     if [[ $remarked -eq 0 ]]; then
@@ -295,25 +278,6 @@ cmd_remark() {
 
 # ── interactive ──────────────────────────────────────────────────────────────
 
-# Helper: check if a path has been seen already
-_seen() {
-    local target="$1"
-    for s in "${seen[@]+"${seen[@]}"}"; do [[ "$s" == "$target" ]] && return 0; done
-    return 1
-}
-
-# Helper: append a separator sentinel between non-empty groups
-_add_separator() {
-    local len=${#candidates[@]}
-    [[ $len -gt 0 && "${candidates[$((len-1))]}" != "" ]] || return 0
-    candidates+=("")
-    display_names+=("")
-    selected+=(false)
-    is_marked+=(false)
-    is_changed+=(false)
-    is_untracked+=(false)
-}
-
 cmd_interactive() {
     # Collect into groups, then merge: changed → modified → untracked → hidden
     # Sentinel entries (empty candidate) act as visual separators.
@@ -325,6 +289,23 @@ cmd_interactive() {
     local is_marked=()
     local is_changed=()
     local is_untracked=()
+
+    _seen() {
+        local target="$1"
+        for s in "${seen[@]+"${seen[@]}"}"; do [[ "$s" == "$target" ]] && return 0; done
+        return 1
+    }
+
+    _add_separator() {
+        local len=${#candidates[@]}
+        [[ $len -gt 0 && "${candidates[$((len-1))]}" != "" ]] || return 0
+        candidates+=("")
+        display_names+=("")
+        selected+=(false)
+        is_marked+=(false)
+        is_changed+=(false)
+        is_untracked+=(false)
+    }
 
     # Temporary per-group arrays (each entry is "idx" into the parallel arrays)
     local g_changed=() g_modified=() g_untracked=() g_hidden=()
@@ -370,14 +351,14 @@ cmd_interactive() {
         _seen "$path" && continue
         seen+=("$path")
         g_modified+=("$path|false|false|false|$path ${C_CYAN}(modified)${C_RST}|false")
-    done < <(git diff -z --name-only "$REPO_ROOT")
+    done < <(git -C "$REPO_ROOT" diff -z --name-only)
 
     # ── Collect untracked files ──
     while IFS= read -r -d '' path; do
         _seen "$path" && continue
         seen+=("$path")
         g_untracked+=("$path|false|false|true|$path ${C_DIM}(untracked)${C_RST}|false")
-    done < <(git ls-files -z --others --exclude-standard "$REPO_ROOT")
+    done < <(git -C "$REPO_ROOT" ls-files -z --others --exclude-standard)
 
     # ── Merge groups in order: changed → modified → untracked → hidden ──
     _unpack_group() {
@@ -560,6 +541,9 @@ cmd_unmark() {
     [[ $# -eq 0 ]] && die "usage: git local unmark <pathspec>... (e.g. . or *)"
     init
 
+    [[ -f "$MARKS_FILE" && -s "$MARKS_FILE" ]] \
+        || { echo "no files currently marked"; return 0; }
+
     local tracked_marks=() untracked_marks=()
     while IFS=' ' read -r hash path || [[ -n "$hash" ]]; do
         [[ -z "$hash" || -z "$path" ]] && continue
@@ -569,9 +553,6 @@ cmd_unmark() {
             tracked_marks+=("$path")
         fi
     done < "$MARKS_FILE"
-
-    [[ ${#tracked_marks[@]} -eq 0 && ${#untracked_marks[@]} -eq 0 ]] \
-        && { echo "no files currently marked"; return 0; }
 
     local found_any=false
 
@@ -636,8 +617,17 @@ do_sync() {
         local stored="${hashes[$i]}"
         local full="$REPO_ROOT/$p"
 
-        # Untracked files are hidden via exclude, not skip-worktree
-        [[ "$stored" == "untracked" ]] && continue
+        # Untracked files: only need to clean up if deleted
+        if [[ "$stored" == "untracked" ]]; then
+            if [[ ! -f "$full" ]]; then
+                exclude_remove "$p"
+                hashes[$i]=""
+                paths[$i]=""
+                dirty=true
+                printf 'removed: %s (deleted untracked)\n' "$p"
+            fi
+            continue
+        fi
 
         if [[ ! -f "$full" ]]; then
             git -C "$REPO_ROOT" update-index --no-skip-worktree -- "$p" 2>/dev/null || true
@@ -669,7 +659,6 @@ do_sync() {
 
     if $dirty; then
         local tmp="$MARKS_FILE.tmp"
-        : > "$tmp"
         for i in "${!paths[@]}"; do
             [[ -n "${paths[$i]}" ]] && printf '%s %s\n' "${hashes[$i]}" "${paths[$i]}"
         done > "$tmp"
@@ -946,9 +935,9 @@ daemon:
   service install   Install daemon as a LaunchAgent (survives reboots)
   service uninstall Remove daemon
 
-Files are hidden via --skip-worktree as long as their content hash
-matches the snapshot taken at mark time. When the content diverges,
-the daemon detects the mismatch and reveals the file to git.
+Tracked files are hidden via --skip-worktree. When the content hash
+diverges from the snapshot taken at mark time, the daemon reveals
+the file to git. Untracked files are hidden via .git/info/exclude.
 
 After committing real changes, re-run 'mark' to re-hide local edits.
 
