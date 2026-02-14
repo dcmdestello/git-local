@@ -203,6 +203,13 @@ notify_watcher() {
 
 cmd_hide() {
     init
+
+    # Auto-enable if disabled
+    if [[ -f "$GIT_DIR/local-disabled" ]]; then
+        printf "${C_CYAN}re-enabling hiding...${C_RST}\n"
+        cmd_enable
+    fi
+
     if [[ $# -eq 0 ]]; then
         cmd_interactive
         notify_watcher
@@ -251,6 +258,13 @@ cmd_hide() {
 
 cmd_rehide() {
     init
+
+    # Auto-enable if disabled
+    if [[ -f "$GIT_DIR/local-disabled" ]]; then
+        printf "${C_CYAN}re-enabling hiding...${C_RST}\n"
+        cmd_enable
+    fi
+
     [[ -f "$HIDDEN_FILE" && -s "$HIDDEN_FILE" ]] || { echo "no files hidden"; return 0; }
 
     local new_entries=() rehidden=0 unchanged=0
@@ -583,6 +597,12 @@ cmd_show() {
     [[ $# -eq 0 ]] && die "usage: git local show <pathspec>... (e.g. src/file.txt or .)"
     init
 
+    # Auto-enable if disabled
+    if [[ -f "$GIT_DIR/local-disabled" ]]; then
+        printf "${C_CYAN}re-enabling hiding...${C_RST}\n"
+        cmd_enable
+    fi
+
     [[ -f "$HIDDEN_FILE" && -s "$HIDDEN_FILE" ]] \
         || { echo "no files currently hidden"; return 0; }
 
@@ -723,6 +743,13 @@ cmd_status() {
              printf "${C_DIM}(Run \"git local service install\" to enable auto-sync)${C_RST}\n"
         fi
     fi
+
+    # Show disabled state
+    if [[ -f "$GIT_DIR/local-disabled" ]]; then
+        printf "${C_YELLOW}⚠️  Hiding is currently DISABLED${C_RST}\n"
+        echo "Run 'git local enable' or any hide/show command to restore."
+    fi
+
     echo ""
 
     [[ -f "$HIDDEN_FILE" && -s "$HIDDEN_FILE" ]] || { echo "no files hidden"; return 0; }
@@ -946,6 +973,13 @@ cmd_service_status() {
 
 cmd_reset() {
     init
+
+    # Auto-enable if disabled
+    if [[ -f "$GIT_DIR/local-disabled" ]]; then
+        printf "${C_CYAN}re-enabling hiding...${C_RST}\n"
+        cmd_enable
+    fi
+
     [[ -f "$HIDDEN_FILE" && -s "$HIDDEN_FILE" ]] \
         || { echo "no files currently hidden"; return 0; }
 
@@ -963,6 +997,79 @@ cmd_reset() {
     notify_watcher
 }
 
+# ── disable/enable ──────────────────────────────────────────────────────────
+
+cmd_disable() {
+    init
+
+    # Check if already disabled
+    if [[ -f "$GIT_DIR/local-disabled" ]]; then
+        echo "hiding is already disabled"
+        return 0
+    fi
+
+    # Check if we have hidden files
+    [[ -f "$HIDDEN_FILE" && -s "$HIDDEN_FILE" ]] || {
+        echo "no files currently hidden"
+        return 0
+    }
+
+    # Count and unhide all files (tracked and untracked)
+    local count=0
+    while IFS=' ' read -r hash path || [[ -n "$hash" ]]; do
+        [[ -z "$hash" || -z "$path" ]] && continue
+
+        if [[ "$hash" == "untracked" ]]; then
+            exclude_remove "$path"
+        else
+            git -C "$REPO_ROOT" update-index --no-skip-worktree -- "$path" 2>/dev/null || true
+        fi
+        ((count++))
+    done < "$HIDDEN_FILE"
+
+    # Create disabled flag
+    touch "$GIT_DIR/local-disabled"
+
+    printf "${C_YELLOW}disabled hiding${C_RST} for %d file(s)\n" "$count"
+    echo "files are now visible. run 'git local enable' or any hide/show command to restore."
+}
+
+cmd_enable() {
+    init
+
+    # Check if actually disabled
+    if [[ ! -f "$GIT_DIR/local-disabled" ]]; then
+        echo "hiding is not disabled"
+        return 0
+    fi
+
+    # Check if we have hidden files registry
+    [[ -f "$HIDDEN_FILE" && -s "$HIDDEN_FILE" ]] || {
+        echo "no hidden files in registry"
+        rm -f "$GIT_DIR/local-disabled"
+        return 0
+    }
+
+    # Re-hide all files from registry
+    local count=0
+    while IFS=' ' read -r hash path || [[ -n "$hash" ]]; do
+        [[ -z "$hash" || -z "$path" ]] && continue
+
+        if [[ "$hash" == "untracked" ]]; then
+            exclude_add "$path"
+        else
+            git -C "$REPO_ROOT" update-index --skip-worktree -- "$path" 2>/dev/null || true
+        fi
+        ((count++))
+    done < "$HIDDEN_FILE"
+
+    # Remove disabled flag
+    rm -f "$GIT_DIR/local-disabled"
+
+    printf "${C_GREEN}re-enabled hiding${C_RST} for %d file(s)\n" "$count"
+    notify_watcher
+}
+
 # ── main ─────────────────────────────────────────────────────────────────────
 
 case "${1:-hide}" in
@@ -970,6 +1077,8 @@ case "${1:-hide}" in
     rehide) cmd_rehide ;;
     show|unhide) shift; cmd_show "$@" ;;
     reset)  cmd_reset ;;
+    disable) cmd_disable ;;
+    enable) cmd_enable ;;
     sync)   cmd_sync ;;
     status|ls) cmd_status ;;
     daemon) shift; cmd_daemon "$@" ;;
@@ -997,6 +1106,8 @@ commands:
   show <spec>...    Unhide matching files
   rehide            Re-hide revealed files with updated snapshots
   reset             Unhide all files
+  disable           Temporarily unhide all files (for merge/pull/rebase)
+  enable            Re-hide all files and restore hidden state
   status            List hidden files and their state
   sync              Re-check hidden files (the daemon does this automatically)
 
