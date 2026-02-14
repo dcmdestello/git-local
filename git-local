@@ -25,6 +25,8 @@ init() {
     GIT_DIR=$(git rev-parse --git-dir 2>/dev/null) || die "not in a git repository"
     REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || die "cannot find repo root"
     HIDDEN_FILE="$GIT_DIR/local-hidden"
+    CWD_PREFIX=$(git rev-parse --show-prefix 2>/dev/null)
+    CWD_PREFIX="${CWD_PREFIX%/}"
 }
 
 init_for_repo() {
@@ -39,6 +41,36 @@ repo_relative() {
     local abs
     abs="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
     printf '%s' "${abs#"$REPO_ROOT"/}"
+}
+
+# Convert repo-relative path to cwd-relative path for display
+cwd_relative() {
+    local path="$1"
+    [[ -z "$CWD_PREFIX" ]] && { printf '%s' "$path"; return; }
+
+    IFS='/' read -ra path_parts <<< "$path"
+    IFS='/' read -ra pref_parts <<< "$CWD_PREFIX"
+
+    # Find common prefix length
+    local common=0
+    local max=${#pref_parts[@]}
+    [[ ${#path_parts[@]} -lt $max ]] && max=${#path_parts[@]}
+    for ((i=0; i<max; i++)); do
+        [[ "${path_parts[$i]}" == "${pref_parts[$i]}" ]] || break
+        ((common++))
+    done
+
+    # Build relative path: ../ for each remaining prefix component
+    local result=""
+    for ((i=common; i<${#pref_parts[@]}; i++)); do
+        result="../$result"
+    done
+    for ((i=common; i<${#path_parts[@]}; i++)); do
+        result="$result${path_parts[$i]}/"
+    done
+    result="${result%/}"
+
+    printf '%s' "$result"
 }
 
 # ── exclude helpers (for untracked files) ────────────────────────────────────
@@ -203,7 +235,7 @@ cmd_hide() {
         printf '%s %s\n' "$hash" "$rel" >> "$HIDDEN_FILE"
         git -C "$REPO_ROOT" update-index --skip-worktree -- "$rel"
 
-        printf "${C_GREEN}hidden:${C_RST} %s ${C_DIM}(%s)${C_RST}\n" "$rel" "${hash:0:8}"
+        printf "${C_GREEN}hidden:${C_RST} %s ${C_DIM}(%s)${C_RST}\n" "$(cwd_relative "$rel")" "${hash:0:8}"
     done
 
     for rel in ${untracked[@]+"${untracked[@]}"}; do
@@ -211,7 +243,7 @@ cmd_hide() {
         drop_entry "$rel"
         printf '%s %s\n' "untracked" "$rel" >> "$HIDDEN_FILE"
 
-        printf "${C_GREEN}hidden:${C_RST} %s ${C_DIM}(untracked)${C_RST}\n" "$rel"
+        printf "${C_GREEN}hidden:${C_RST} %s ${C_DIM}(untracked)${C_RST}\n" "$(cwd_relative "$rel")"
     done
 
     notify_watcher
@@ -233,7 +265,7 @@ cmd_rehide() {
                 ((unchanged++)) || true
             else
                 exclude_remove "$path"
-                printf "${C_DIM}removed: %s (deleted)${C_RST}\n" "$path"
+                printf "${C_DIM}removed: %s (deleted)${C_RST}\n" "$(cwd_relative "$path")"
             fi
             continue
         fi
@@ -249,7 +281,7 @@ cmd_rehide() {
         if [[ "$current" != "$stored_hash" ]]; then
             new_entries+=("$current $path")
             git -C "$REPO_ROOT" update-index --skip-worktree -- "$path" 2>/dev/null || true
-            printf "${C_CYAN}re-hidden:${C_RST} %s\n" "$path"
+            printf "${C_CYAN}re-hidden:${C_RST} %s\n" "$(cwd_relative "$path")"
             ((rehidden++)) || true
         else
             new_entries+=("$stored_hash $path")
@@ -315,7 +347,7 @@ cmd_interactive() {
             # Untracked files hidden via exclude — show in hidden group
             if [[ "$stored_hash" == "untracked" ]]; then
                 if [[ -f "$REPO_ROOT/$path" ]]; then
-                    g_hidden_untracked+=("$path|true|false|true|$path ${C_GREEN}(hidden, untracked)${C_RST}|x")
+                    g_hidden_untracked+=("$path|true|false|true|$(cwd_relative "$path") ${C_GREEN}(hidden, untracked)${C_RST}|x")
                 else
                     # File deleted, auto-clean
                     drop_entry "$path"
@@ -334,9 +366,9 @@ cmd_interactive() {
             local current_hash
             current_hash=$(git hash-object "$REPO_ROOT/$path")
             if [[ "$current_hash" == "$stored_hash" ]]; then
-                g_hidden_tracked+=("$path|true|false|false|$path ${C_GREEN}(hidden)${C_RST}|x")
+                g_hidden_tracked+=("$path|true|false|false|$(cwd_relative "$path") ${C_GREEN}(hidden)${C_RST}|x")
             else
-                g_changed+=("$path|true|true|false|$path ${C_YELLOW}(changed)${C_RST}|-")
+                g_changed+=("$path|true|true|false|$(cwd_relative "$path") ${C_YELLOW}(changed)${C_RST}|-")
             fi
         done < "$HIDDEN_FILE"
     fi
@@ -345,14 +377,14 @@ cmd_interactive() {
     while IFS= read -r -d '' path; do
         _seen "$path" && continue
         seen+=("$path")
-        g_modified+=("$path|false|false|false|$path ${C_DIM}(modified)${C_RST}| ")
+        g_modified+=("$path|false|false|false|$(cwd_relative "$path") ${C_DIM}(modified)${C_RST}| ")
     done < <(git -C "$REPO_ROOT" diff -z --name-only)
 
     # ── Collect untracked files ──
     while IFS= read -r -d '' path; do
         _seen "$path" && continue
         seen+=("$path")
-        g_untracked+=("$path|false|false|true|$path ${C_DIM}(untracked)${C_RST}| ")
+        g_untracked+=("$path|false|false|true|$(cwd_relative "$path") ${C_DIM}(untracked)${C_RST}| ")
     done < <(git -C "$REPO_ROOT" ls-files -z --others --exclude-standard)
 
     # ── Merge groups in order: changed → modified → untracked → hidden ──
@@ -523,7 +555,7 @@ cmd_interactive() {
                 printf '%s %s\n' "$hash" "$path" >> "$HIDDEN_FILE"
                 git -C "$REPO_ROOT" update-index --skip-worktree -- "$path"
             fi
-            printf "${C_GREEN}hidden:${C_RST} %s\n" "$path"
+            printf "${C_GREEN}hidden:${C_RST} %s\n" "$(cwd_relative "$path")"
         elif [[ "$sel" == "x" ]] && [[ "$was_hidden" == "true" ]] && [[ "$changed" == "true" ]]; then
             # Re-hide with updated hash
             local hash
@@ -531,7 +563,7 @@ cmd_interactive() {
             drop_entry "$path"
             printf '%s %s\n' "$hash" "$path" >> "$HIDDEN_FILE"
             git -C "$REPO_ROOT" update-index --skip-worktree -- "$path" 2>/dev/null || true
-            printf "${C_CYAN}re-hidden:${C_RST} %s\n" "$path"
+            printf "${C_CYAN}re-hidden:${C_RST} %s\n" "$(cwd_relative "$path")"
         elif [[ "$sel" == " " ]] && [[ "$was_hidden" == "true" ]]; then
             # Unhide
             drop_entry "$path"
@@ -540,7 +572,7 @@ cmd_interactive() {
             else
                 git -C "$REPO_ROOT" update-index --no-skip-worktree -- "$path" 2>/dev/null || true
             fi
-            printf "${C_YELLOW}unhidden:${C_RST} %s\n" "$path"
+            printf "${C_YELLOW}unhidden:${C_RST} %s\n" "$(cwd_relative "$path")"
         fi
     done
 }
@@ -573,7 +605,7 @@ cmd_show() {
                 if [[ "$cand" == "$entry" ]]; then
                     drop_entry "$entry"
                     git -C "$REPO_ROOT" update-index --no-skip-worktree -- "$entry" 2>/dev/null || true
-                    printf "${C_YELLOW}unhidden:${C_RST} %s\n" "$entry"
+                    printf "${C_YELLOW}unhidden:${C_RST} %s\n" "$(cwd_relative "$entry")"
                     found_any=true
                     break
                 fi
@@ -590,7 +622,7 @@ cmd_show() {
             if [[ "$entry" == "$rel_arg" || "$rel_arg" == "." || "$entry" == "$rel_arg"/* ]]; then
                 drop_entry "$entry"
                 exclude_remove "$entry"
-                printf "${C_YELLOW}unhidden:${C_RST} %s\n" "$entry"
+                printf "${C_YELLOW}unhidden:${C_RST} %s\n" "$(cwd_relative "$entry")"
                 found_any=true
                 break
             fi
@@ -724,7 +756,7 @@ cmd_status() {
             hash_display="${stored_hash:0:8}"
         fi
 
-        printf "%-45s  ${state_color}%-18s${C_RST}  ${C_DIM}%s${C_RST}\n" "$path" "$state" "$hash_display"
+        printf "%-45s  ${state_color}%-18s${C_RST}  ${C_DIM}%s${C_RST}\n" "$(cwd_relative "$path")" "$state" "$hash_display"
     done < "$HIDDEN_FILE"
 }
 
@@ -924,7 +956,7 @@ cmd_reset() {
         else
             git -C "$REPO_ROOT" update-index --no-skip-worktree -- "$path" 2>/dev/null || true
         fi
-        printf "${C_YELLOW}unhidden:${C_RST} %s\n" "$path"
+        printf "${C_YELLOW}unhidden:${C_RST} %s\n" "$(cwd_relative "$path")"
     done < "$HIDDEN_FILE"
 
     rm -f "$HIDDEN_FILE"
