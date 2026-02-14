@@ -1,0 +1,106 @@
+# git-local — Design Notes
+
+## A) Goal
+
+Hide files from git status without losing awareness of upstream changes.
+
+Use case: You have files with local development changes (debug flags, test
+data, personal config) that you never intend to commit but that clutter
+git status. You want those files invisible to git status — and to any tool
+that reads git status, like Cursor or VS Code — while still being notified
+when those files receive legitimate upstream changes (e.g., a teammate
+edits the same config file).
+
+This is different from .gitignore: ignored files are completely invisible
+to git. Hidden files are tracked files that you want to keep tracking, just
+not display as dirty.
+
+## B) Current Solution
+
+Two mechanisms, one for tracked files, one for untracked:
+
+**Tracked files:**
+  git update-index --skip-worktree <file>
+This tells git to pretend the working tree version matches the index.
+git status sees no diff, so the file disappears from status output.
+
+**Untracked files:**
+  .git/info/exclude
+A per-repo .gitignore that isn't committed. The file disappears from
+the untracked list.
+
+**Content-aware snapshots:**
+When hiding a file, git-local stores a hash of its contents in
+.git/local-hidden. A background daemon (LaunchAgent on macOS) watches
+for changes. If the working tree content diverges from the stored hash,
+the daemon removes --skip-worktree, making the file reappear in
+git status. This is the "content-aware" part: hidden files automatically
+resurface when something other than your own local edits changes them.
+
+**Interactive UI:**
+Running `git local` with no arguments opens a TUI that lists modified,
+untracked, and hidden files. Users toggle selections and apply changes
+on exit.
+
+## C) Problems Ahead
+
+### 1. Merge/pull conflicts with hidden files
+
+--skip-worktree tells git the working tree matches the index. When a
+merge or pull would modify a skip-worktree file, git aborts:
+
+    error: Your local changes to the following files would be overwritten
+    by merge: animals.txt
+    Please commit your changes or stash them before you merge.
+    Aborting
+
+The user hasn't done anything wrong — the file was hidden, not manually
+changed. But git doesn't distinguish between "actually modified" and
+"skip-worktree with different content."
+
+This is the main unsolved problem. Git provides no hook that runs before
+merge checks skip-worktree, so we cannot intercept and temporarily
+unhide files before the merge starts. The merge simply fails.
+
+Possible approaches, all with trade-offs:
+
+- **Recovery command:** Accept that merge fails, provide `git local
+  fix-merge` to unhide affected files so the user can retry. Simple
+  but reactive — requires the user to know the command exists.
+
+- **Wrapper commands:** `git local pull`, `git local merge` that unhide
+  before running git. Doesn't help when Cursor or an IDE runs git
+  directly.
+
+- **Clean/smudge filters:** ❌ RULED OUT. Testing shows git status
+  doesn't run the clean filter — it directly compares working tree to
+  index. File still shows as modified in status even with filters
+  configured. Filters only affect git diff and operations that read
+  file content. Does not solve the core problem.
+
+- **Accept and document:** Keep current behavior, document the
+  limitation, and tell users to run `git local show <file>` before
+  merging when they know a hidden file is involved.
+
+### 2. Rebase has the same problem
+
+`git rebase` performs the same working-tree check as merge. Hidden files
+with local changes will block rebase with the same error.
+
+### 3. Stash interaction
+
+`git stash` may or may not pick up skip-worktree files depending on
+flags. The behavior is non-obvious and could confuse users.
+
+### 4. Checkout / switch
+
+Switching branches that modify a hidden file can also fail with a
+similar error. Same root cause as the merge problem.
+
+### 5. No pre-merge hook in git
+
+Git provides post-merge and pre-merge-commit hooks, but no hook that
+runs before the merge working-tree check. This means we cannot
+automatically unhide files at the right moment. Any hook-based solution
+would require the user to manually trigger something first, or would
+need to wrap every git command.
