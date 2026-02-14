@@ -177,41 +177,36 @@ cmd_hide() {
         return
     fi
 
-    # Collect modified tracked files
+    # Collect modified tracked files (repo-relative paths)
     local files=()
     while IFS= read -r -d '' file; do
         files+=("$file")
-    done < <(git diff -z --name-only --relative -- "$@")
+    done < <(git diff -z --name-only -- "$@")
 
-    # Also collect untracked files matching the arguments
+    # Also collect untracked files matching the arguments (repo-relative paths)
     local untracked=()
     while IFS= read -r -d '' file; do
         untracked+=("$file")
-    done < <(git ls-files -z --others --exclude-standard -- "$@")
+    done < <(git ls-files -z --full-name --others --exclude-standard -- "$@")
 
     if [[ ${#files[@]} -eq 0 && ${#untracked[@]} -eq 0 ]]; then
         printf 'no modified or untracked files found matching arguments\n'
+        notify_watcher
         return 0
     fi
 
-    for file in ${files[@]+"${files[@]}"}; do
-        local rel
-        rel=$(repo_relative "$file")
-
+    for rel in ${files[@]+"${files[@]}"}; do
         local hash
         hash=$(git hash-object "$REPO_ROOT/$rel")
 
         drop_entry "$rel"
         printf '%s %s\n' "$hash" "$rel" >> "$HIDDEN_FILE"
-        git update-index --skip-worktree -- "$rel"
+        git -C "$REPO_ROOT" update-index --skip-worktree -- "$rel"
 
         printf "${C_GREEN}hidden:${C_RST} %s ${C_DIM}(%s)${C_RST}\n" "$rel" "${hash:0:8}"
     done
 
-    for file in ${untracked[@]+"${untracked[@]}"}; do
-        local rel
-        rel=$(repo_relative "$file")
-
+    for rel in ${untracked[@]+"${untracked[@]}"}; do
         exclude_add "$rel"
         drop_entry "$rel"
         printf '%s %s\n' "untracked" "$rel" >> "$HIDDEN_FILE"
@@ -244,7 +239,7 @@ cmd_rehide() {
         fi
 
         if [[ ! -f "$REPO_ROOT/$path" ]]; then
-            git update-index --no-skip-worktree -- "$path" 2>/dev/null || true
+            git -C "$REPO_ROOT" update-index --no-skip-worktree -- "$path" 2>/dev/null || true
             continue
         fi
 
@@ -253,7 +248,7 @@ cmd_rehide() {
 
         if [[ "$current" != "$stored_hash" ]]; then
             new_entries+=("$current $path")
-            git update-index --skip-worktree -- "$path" 2>/dev/null || true
+            git -C "$REPO_ROOT" update-index --skip-worktree -- "$path" 2>/dev/null || true
             printf "${C_CYAN}re-hidden:${C_RST} %s\n" "$path"
             ((rehidden++)) || true
         else
@@ -332,7 +327,7 @@ cmd_interactive() {
             # Auto-clean deleted tracked files
             if [[ ! -f "$REPO_ROOT/$path" ]]; then
                 drop_entry "$path"
-                git update-index --no-skip-worktree -- "$path" 2>/dev/null || true
+                git -C "$REPO_ROOT" update-index --no-skip-worktree -- "$path" 2>/dev/null || true
                 continue
             fi
 
@@ -526,7 +521,7 @@ cmd_interactive() {
                 hash=$(git hash-object "$REPO_ROOT/$path")
                 drop_entry "$path"
                 printf '%s %s\n' "$hash" "$path" >> "$HIDDEN_FILE"
-                git update-index --skip-worktree -- "$path"
+                git -C "$REPO_ROOT" update-index --skip-worktree -- "$path"
             fi
             printf "${C_GREEN}hidden:${C_RST} %s\n" "$path"
         elif [[ "$sel" == "x" ]] && [[ "$was_hidden" == "true" ]] && [[ "$changed" == "true" ]]; then
@@ -535,7 +530,7 @@ cmd_interactive() {
             hash=$(git hash-object "$REPO_ROOT/$path")
             drop_entry "$path"
             printf '%s %s\n' "$hash" "$path" >> "$HIDDEN_FILE"
-            git update-index --skip-worktree -- "$path" 2>/dev/null || true
+            git -C "$REPO_ROOT" update-index --skip-worktree -- "$path" 2>/dev/null || true
             printf "${C_CYAN}re-hidden:${C_RST} %s\n" "$path"
         elif [[ "$sel" == " " ]] && [[ "$was_hidden" == "true" ]]; then
             # Unhide
@@ -543,7 +538,7 @@ cmd_interactive() {
             if [[ "$untracked" == "true" ]]; then
                 exclude_remove "$path"
             else
-                git update-index --no-skip-worktree -- "$path" 2>/dev/null || true
+                git -C "$REPO_ROOT" update-index --no-skip-worktree -- "$path" 2>/dev/null || true
             fi
             printf "${C_YELLOW}unhidden:${C_RST} %s\n" "$path"
         fi
@@ -574,19 +569,16 @@ cmd_show() {
     # Unhide tracked files via git ls-files pathspec matching
     if [[ ${#tracked_hidden[@]} -gt 0 ]]; then
         while IFS= read -r -d '' cand; do
-            local rel_cand
-            rel_cand=$(repo_relative "$cand")
-
             for entry in "${tracked_hidden[@]}"; do
-                if [[ "$rel_cand" == "$entry" ]]; then
+                if [[ "$cand" == "$entry" ]]; then
                     drop_entry "$entry"
-                    git update-index --no-skip-worktree -- "$entry" 2>/dev/null || true
+                    git -C "$REPO_ROOT" update-index --no-skip-worktree -- "$entry" 2>/dev/null || true
                     printf "${C_YELLOW}unhidden:${C_RST} %s\n" "$entry"
                     found_any=true
                     break
                 fi
             done
-        done < <(git ls-files -z -- "$@")
+        done < <(git ls-files -z --full-name -- "$@")
     fi
 
     # Unhide untracked (excluded) files by matching args against paths
@@ -930,7 +922,7 @@ cmd_reset() {
         if [[ "$hash" == "untracked" ]]; then
             exclude_remove "$path"
         else
-            git update-index --no-skip-worktree -- "$path" 2>/dev/null || true
+            git -C "$REPO_ROOT" update-index --no-skip-worktree -- "$path" 2>/dev/null || true
         fi
         printf "${C_YELLOW}unhidden:${C_RST} %s\n" "$path"
     done < "$HIDDEN_FILE"
