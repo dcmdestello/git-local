@@ -341,7 +341,7 @@ cmd_interactive() {
         local len=${#candidates[@]}
         [[ $len -gt 0 && "${candidates[$((len-1))]}" != "" ]] || return 0
         candidates+=("")
-        display_names+=("")
+        display_names+=("||")  # Empty separator: no filename, dirname, status
         selected+=(" ")
         is_hidden+=(false)
         is_changed+=(false)
@@ -370,7 +370,12 @@ cmd_interactive() {
             # Untracked files hidden via exclude — show in hidden group
             if [[ "$stored_hash" == "untracked" ]]; then
                 if [[ -f "$REPO_ROOT/$path" ]]; then
-                    g_hidden_untracked+=("$path|true|false|true|$(cwd_relative "$path") ${C_GREEN}(hidden, untracked)${C_RST}|x")
+                    local rel_path
+                    rel_path=$(cwd_relative "$path")
+                    local filename="${rel_path##*/}"
+                    local dirname="${rel_path%/*}"
+                    [[ "$dirname" == "$rel_path" ]] && dirname="."
+                    g_hidden_untracked+=("$path|true|false|true|$filename|$dirname|hidden, untracked|x")
                 else
                     # File deleted, auto-clean
                     drop_entry "$path"
@@ -388,10 +393,16 @@ cmd_interactive() {
 
             local current_hash
             current_hash=$(git hash-object "$REPO_ROOT/$path")
+            local rel_path
+            rel_path=$(cwd_relative "$path")
+            local filename="${rel_path##*/}"
+            local dirname="${rel_path%/*}"
+            [[ "$dirname" == "$rel_path" ]] && dirname="."
+
             if [[ "$current_hash" == "$stored_hash" ]]; then
-                g_hidden_tracked+=("$path|true|false|false|$(cwd_relative "$path") ${C_GREEN}(hidden)${C_RST}|x")
+                g_hidden_tracked+=("$path|true|false|false|$filename|$dirname|hidden|x")
             else
-                g_changed+=("$path|true|true|false|$(cwd_relative "$path") ${C_YELLOW}(changed)${C_RST}|-")
+                g_changed+=("$path|true|true|false|$filename|$dirname|changed|-")
             fi
         done < "$HIDDEN_FILE"
     fi
@@ -400,26 +411,37 @@ cmd_interactive() {
     while IFS= read -r -d '' path; do
         _seen "$path" && continue
         seen+=("$path")
-        g_modified+=("$path|false|false|false|$(cwd_relative "$path") ${C_DIM}(modified)${C_RST}| ")
+        local rel_path
+        rel_path=$(cwd_relative "$path")
+        local filename="${rel_path##*/}"
+        local dirname="${rel_path%/*}"
+        [[ "$dirname" == "$rel_path" ]] && dirname="."
+        g_modified+=("$path|false|false|false|$filename|$dirname|modified| ")
     done < <(git -C "$REPO_ROOT" diff -z --name-only)
 
     # ── Collect untracked files ──
     while IFS= read -r -d '' path; do
         _seen "$path" && continue
         seen+=("$path")
-        g_untracked+=("$path|false|false|true|$(cwd_relative "$path") ${C_DIM}(untracked)${C_RST}| ")
+        local rel_path
+        rel_path=$(cwd_relative "$path")
+        local filename="${rel_path##*/}"
+        local dirname="${rel_path%/*}"
+        [[ "$dirname" == "$rel_path" ]] && dirname="."
+        g_untracked+=("$path|false|false|true|$filename|$dirname|untracked| ")
     done < <(git -C "$REPO_ROOT" ls-files -z --others --exclude-standard)
 
     # ── Merge groups in order: changed → modified → untracked → hidden ──
     _unpack_group() {
         for entry in "$@"; do
             local IFS='|'
-            read -r _p _m _c _u _d _s <<< "$entry"
+            read -r _p _m _c _u _f _d _st _s <<< "$entry"
             candidates+=("$_p")
             is_hidden+=("$_m")
             is_changed+=("$_c")
             is_untracked+=("$_u")
-            display_names+=("$_d")
+            # Store as: filename|dirname|status_label
+            display_names+=("$_f|$_d|$_st")
             selected+=("$_s")
         done
     }
@@ -527,6 +549,15 @@ cmd_interactive() {
         [[ ${#g_changed[@]} -gt 0 ]] && printf "  ${C_DIM}[r] re-hide  [g/G] first/last  [Pg↓/↑] page${C_RST}\n"
         echo ""
 
+        # Calculate max filename width for alignment
+        local max_filename_width=0
+        for ((j=0; j<total; j++)); do
+            if [[ -n "${candidates[$j]}" ]]; then
+                IFS='|' read -r filename dirname status_label <<< "${display_names[$j]}"
+                [[ ${#filename} -gt $max_filename_width ]] && max_filename_width=${#filename}
+            fi
+        done
+
         # Render visible items (viewport)
         local visible_start=$scroll_offset
         local visible_end=$((scroll_offset + viewport_height))
@@ -549,10 +580,36 @@ cmd_interactive() {
                 *) box="[ ]" ;;
             esac
 
+            # Parse display_names: filename|dirname|status_label
+            local IFS='|'
+            read -r filename dirname status_label <<< "${display_names[$i]}"
+            IFS=' '
+
+            # Format status label with color codes
+            local status_display
+            case "$status_label" in
+                "hidden"|"hidden, untracked")
+                    status_display="${C_GREEN}($status_label)${C_RST}"
+                    ;;
+                "changed")
+                    status_display="${C_YELLOW}($status_label)${C_RST}"
+                    ;;
+                *)
+                    status_display="${C_DIM}($status_label)${C_RST}"
+                    ;;
+            esac
+
+            # Format directory path with cyan color
+            local dirname_display="${C_CYAN}$dirname${C_RST}"
+
+            # Format output with columns (aligned by max filename width)
+            local fmt_width=$((max_filename_width + 2))  # Add 2 spaces for padding
             if [[ $i -eq $current ]]; then
-                printf "%s \033[7m%b %b\033[0m\n" "$cursor" "$box" "${display_names[$i]}"
+                printf "%s \033[7m%b %-*s %b %b\033[0m\n" \
+                    "$cursor" "$box" "$fmt_width" "$filename" "$status_display" "$dirname_display"
             else
-                printf "%s %b %b\n" "$cursor" "$box" "${display_names[$i]}"
+                printf "%s %b %-*s %b %b\n" \
+                    "$cursor" "$box" "$fmt_width" "$filename" "$status_display" "$dirname_display"
             fi
         done
 
@@ -828,8 +885,20 @@ cmd_status() {
 
     [[ -f "$HIDDEN_FILE" && -s "$HIDDEN_FILE" ]] || { echo "no files hidden"; return 0; }
 
-    printf "${C_BOLD}%-45s  %-18s  %s${C_RST}\n" "FILE" "STATE" "HASH"
-    printf "${C_DIM}%-45s  %-18s  %s${C_RST}\n" "----" "-----" "----"
+    # Calculate max filename width for alignment
+    local max_filename_width=0
+    while IFS=' ' read -r stored_hash path || [[ -n "$stored_hash" ]]; do
+        [[ -z "$stored_hash" ]] && continue
+        local rel_path
+        rel_path=$(cwd_relative "$path")
+        local filename="${rel_path##*/}"
+        [[ ${#filename} -gt $max_filename_width ]] && max_filename_width=${#filename}
+    done < "$HIDDEN_FILE"
+
+    local filename_col_width=$((max_filename_width + 2))
+
+    printf "${C_BOLD}%-*s %-18s %-8s %s${C_RST}\n" "$filename_col_width" "FILE" "STATE" "HASH" "PATH"
+    printf "${C_DIM}%-*s %-18s %-8s %s${C_RST}\n" "$filename_col_width" "$(printf '%.0s─' $(seq 1 $max_filename_width))" "──────────────────" "────────" "────"
 
     while IFS=' ' read -r stored_hash path || [[ -n "$stored_hash" ]]; do
         [[ -z "$stored_hash" ]] && continue
@@ -857,7 +926,17 @@ cmd_status() {
             hash_display="${stored_hash:0:8}"
         fi
 
-        printf "%-45s  ${state_color}%-18s${C_RST}  ${C_DIM}%s${C_RST}\n" "$(cwd_relative "$path")" "$state" "$hash_display"
+        # Extract filename and directory from path
+        local rel_path
+        rel_path=$(cwd_relative "$path")
+        local filename="${rel_path##*/}"
+        local dirname="${rel_path%/*}"
+        [[ "$dirname" == "$rel_path" ]] && dirname="."
+
+        # Format directory path with cyan color
+        local dirname_display="${C_CYAN}$dirname${C_RST}"
+
+        printf "%-*s ${state_color}%-18s${C_RST} %-8s %b\n" "$filename_col_width" "$filename" "$state" "$hash_display" "$dirname_display"
     done < "$HIDDEN_FILE"
 }
 
