@@ -348,6 +348,15 @@ cmd_interactive() {
         is_untracked+=(false)
     }
 
+    # Detect terminal dimensions for scrolling
+    local term_width term_height
+    term_width=$(tput cols 2>/dev/null) || term_width=80
+    term_height=$(tput lines 2>/dev/null) || term_height=24
+
+    # Calculate viewport height (height - header(2) - footer(2))
+    local viewport_height=$((term_height - 4))
+    [[ $viewport_height -lt 5 ]] && viewport_height=5  # Minimum viable height
+
     # Temporary per-group arrays (each entry is "idx" into the parallel arrays)
     local g_changed=() g_modified=() g_untracked=() g_hidden_tracked=() g_hidden_untracked=()
 
@@ -436,11 +445,13 @@ cmd_interactive() {
 
     local current=0
     local total=${#candidates[@]}
+    local scroll_offset=0  # Index of first visible item in viewport
 
     # Skip sentinel if cursor starts on one
     while [[ $current -lt $total && -z "${candidates[$current]}" ]]; do
         ((current++)) || true
     done
+
 
     # ── Navigation helpers (skip sentinels) ──
     _move_down() {
@@ -460,20 +471,68 @@ cmd_interactive() {
         done
     }
 
+    _move_page_down() {
+        local jump=$((viewport_height / 2))
+        [[ $jump -lt 1 ]] && jump=1
+        for ((i=0; i<jump; i++)); do
+            _move_down
+        done
+    }
+
+    _move_page_up() {
+        local jump=$((viewport_height / 2))
+        [[ $jump -lt 1 ]] && jump=1
+        for ((i=0; i<jump; i++)); do
+            _move_up
+        done
+    }
+
+    _move_to_first() {
+        current=0
+        while [[ $current -lt $total && -z "${candidates[$current]}" ]]; do
+            ((current++)) || true
+        done
+    }
+
+    _move_to_last() {
+        current=$((total-1))
+        while [[ $current -ge 0 && -z "${candidates[$current]}" ]]; do
+            ((current--)) || true
+        done
+    }
+
     # ── TUI Loop ──
     printf '\033[?25l'
     trap "printf '\033[?25h'" EXIT
 
     while true; do
+        # Auto-scroll to keep cursor in view
+        local first_visible=$scroll_offset
+        local last_visible=$((scroll_offset + viewport_height - 1))
+        if [[ $current -lt $first_visible ]]; then
+            scroll_offset=$current
+        elif [[ $current -gt $last_visible ]]; then
+            scroll_offset=$((current - viewport_height + 1))
+        fi
+        local max_scroll=$((total - viewport_height))
+        [[ $max_scroll -lt 0 ]] && max_scroll=0
+        [[ $scroll_offset -lt 0 ]] && scroll_offset=0
+        [[ $scroll_offset -gt $max_scroll ]] && scroll_offset=$max_scroll
+
         printf '\033[2J\033[H'
 
         printf "${C_BOLD}Select files to hide:${C_RST}\n"
         printf "  ${C_DIM}[Space] toggle  [Enter] confirm  [q] cancel${C_RST}\n"
-        printf "  ${C_DIM}[w/↑/s/↓] to move  [a] all  [d] none${C_RST}\n"
-        [[ ${#g_changed[@]} -gt 0 ]] && printf "  ${C_DIM}[r] re-hide revealed files${C_RST}\n"
+        printf "  ${C_DIM}[w/↑/s/↓/j/k] move  [a] all  [d] none${C_RST}\n"
+        [[ ${#g_changed[@]} -gt 0 ]] && printf "  ${C_DIM}[r] re-hide  [g/G] first/last  [Pg↓/↑] page${C_RST}\n"
         echo ""
 
-        for ((i=0; i<total; i++)); do
+        # Render visible items (viewport)
+        local visible_start=$scroll_offset
+        local visible_end=$((scroll_offset + viewport_height))
+        [[ $visible_end -gt $total ]] && visible_end=$total
+
+        for ((i=visible_start; i<visible_end; i++)); do
             # Sentinel: blank separator line
             if [[ -z "${candidates[$i]}" ]]; then
                 echo ""
@@ -496,6 +555,17 @@ cmd_interactive() {
                 printf "%s %b %b\n" "$cursor" "$box" "${display_names[$i]}"
             fi
         done
+
+        # Position indicator at bottom
+        echo ""
+        if [[ $total -gt $viewport_height ]]; then
+            printf "${C_DIM}(%d-%d)/%d items${C_RST}\n" \
+                $((visible_start + 1)) \
+                $((visible_end)) \
+                $total
+        else
+            printf "${C_DIM}%d items${C_RST}\n" $total
+        fi
 
         local key
         IFS= read -rsn1 key
@@ -531,11 +601,15 @@ cmd_interactive() {
                 ;;
             "s"|"j") _move_down ;;
             "w"|"k") _move_up ;;
+            "g") _move_to_first ;;
+            "G") _move_to_last ;;
             $'\x1b')
                 read -rsn2 -t 1 key
                 case "$key" in
                     "[A") _move_up ;;
                     "[B") _move_down ;;
+                    "[5") read -rsn1 -t 1 key; [[ "$key" == "~" ]] && _move_page_up ;;
+                    "[6") read -rsn1 -t 1 key; [[ "$key" == "~" ]] && _move_page_down ;;
                 esac
                 ;;
         esac
