@@ -7,8 +7,29 @@ GLOBAL_DIR="$HOME/.git-local"
 GLOBAL_REGISTRY="$GLOBAL_DIR/registry"
 GLOBAL_PID="$GLOBAL_DIR/daemon.pid"
 GLOBAL_LOG="$GLOBAL_DIR/daemon.log"
-LAUNCH_AGENT_LABEL="com.user.git-local"
-LAUNCH_AGENT_PATH="$HOME/Library/LaunchAgents/$LAUNCH_AGENT_LABEL.plist"
+
+# ── platform detection ────────────────────────────────────────────────────────
+
+detect_platform() {
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        PLATFORM="macos"
+    elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
+        PLATFORM="linux"
+    else
+        die "unsupported platform: $OSTYPE"
+    fi
+}
+
+detect_platform
+
+# Set platform-specific service paths
+SERVICE_NAME="git-local"
+if [[ "$PLATFORM" == "macos" ]]; then
+    SERVICE_LABEL="com.user.git-local"
+    SERVICE_PATH="$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"
+elif [[ "$PLATFORM" == "linux" ]]; then
+    SERVICE_PATH="$HOME/.config/systemd/user/$SERVICE_NAME.service"
+fi
 
 # ── colors (disabled when output is not a terminal) ──────────────────────────
 
@@ -1022,26 +1043,23 @@ cmd_daemon() {
     fi
 }
 
-cmd_install_service() {
-    local script_path
-    script_path="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+install_service_macos() {
+    local script_path="$1"
+    mkdir -p "$(dirname "$SERVICE_PATH")"
 
-    mkdir -p "$GLOBAL_DIR"
-    mkdir -p "$(dirname "$LAUNCH_AGENT_PATH")"
-
-    if [[ -f "$LAUNCH_AGENT_PATH" ]]; then
-        printf 'LaunchAgent already exists at %s\n' "$LAUNCH_AGENT_PATH"
+    if [[ -f "$SERVICE_PATH" ]]; then
+        printf 'LaunchAgent already exists at %s\n' "$SERVICE_PATH"
         printf 'Run "git local service uninstall" first to reinstall.\n'
         return 1
     fi
 
-    cat > "$LAUNCH_AGENT_PATH" <<PLIST
+    cat > "$SERVICE_PATH" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>${LAUNCH_AGENT_LABEL}</string>
+    <string>${SERVICE_LABEL}</string>
     <key>ProgramArguments</key>
     <array>
         <string>${script_path}</string>
@@ -1059,25 +1077,97 @@ cmd_install_service() {
 </plist>
 PLIST
 
-    launchctl load -w "$LAUNCH_AGENT_PATH"
-
-    printf "${C_GREEN}Installed global daemon service.${C_RST}\n"
-    printf 'LaunchAgent: %s\n' "$LAUNCH_AGENT_PATH"
+    launchctl load -w "$SERVICE_PATH"
+    printf "${C_GREEN}Installed LaunchAgent service.${C_RST}\n"
+    printf 'LaunchAgent: %s\n' "$SERVICE_PATH"
     printf 'Logs: %s\n' "$GLOBAL_LOG"
-    printf '\nRun "git local service" to verify.\n'
 }
 
-cmd_uninstall_service() {
-    if [[ ! -f "$LAUNCH_AGENT_PATH" ]]; then
-        printf 'No LaunchAgent found at %s\n' "$LAUNCH_AGENT_PATH"
+install_service_linux() {
+    local script_path="$1"
+    mkdir -p "$(dirname "$SERVICE_PATH")"
+
+    if [[ -f "$SERVICE_PATH" ]]; then
+        printf 'systemd service already exists at %s\n' "$SERVICE_PATH"
+        printf 'Run "git local service uninstall" first to reinstall.\n'
         return 1
     fi
 
-    launchctl unload -w "$LAUNCH_AGENT_PATH" 2>/dev/null || true
-    rm -f "$LAUNCH_AGENT_PATH"
+    cat > "$SERVICE_PATH" <<SYSTEMD
+[Unit]
+Description=git-local daemon
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=${script_path} daemon
+Restart=always
+StandardOutput=append:${GLOBAL_LOG}
+StandardError=append:${GLOBAL_LOG}
+
+[Install]
+WantedBy=default.target
+SYSTEMD
+
+    systemctl --user daemon-reload
+    systemctl --user enable "$SERVICE_NAME.service"
+    systemctl --user start "$SERVICE_NAME.service"
+
+    printf "${C_GREEN}Installed systemd user service.${C_RST}\n"
+    printf 'Service file: %s\n' "$SERVICE_PATH"
+    printf 'Logs: %s\n' "$GLOBAL_LOG"
+    printf '\nManage with:\n'
+    printf '  systemctl --user status git-local\n'
+    printf '  systemctl --user restart git-local\n'
+}
+
+cmd_install_service() {
+    local script_path
+    script_path="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+
+    mkdir -p "$GLOBAL_DIR"
+
+    if [[ "$PLATFORM" == "macos" ]]; then
+        install_service_macos "$script_path"
+    elif [[ "$PLATFORM" == "linux" ]]; then
+        install_service_linux "$script_path"
+    fi
+}
+
+uninstall_service_macos() {
+    if [[ ! -f "$SERVICE_PATH" ]]; then
+        printf 'No LaunchAgent found at %s\n' "$SERVICE_PATH"
+        return 1
+    fi
+
+    launchctl unload -w "$SERVICE_PATH" 2>/dev/null || true
+    rm -f "$SERVICE_PATH"
     rm -f "$GLOBAL_PID"
 
-    printf "${C_YELLOW}Uninstalled global daemon service.${C_RST}\n"
+    printf "${C_YELLOW}Uninstalled LaunchAgent service.${C_RST}\n"
+}
+
+uninstall_service_linux() {
+    if [[ ! -f "$SERVICE_PATH" ]]; then
+        printf 'No systemd service found at %s\n' "$SERVICE_PATH"
+        return 1
+    fi
+
+    systemctl --user stop "$SERVICE_NAME.service" 2>/dev/null || true
+    systemctl --user disable "$SERVICE_NAME.service" 2>/dev/null || true
+    rm -f "$SERVICE_PATH"
+    systemctl --user daemon-reload
+    rm -f "$GLOBAL_PID"
+
+    printf "${C_YELLOW}Uninstalled systemd service.${C_RST}\n"
+}
+
+cmd_uninstall_service() {
+    if [[ "$PLATFORM" == "macos" ]]; then
+        uninstall_service_macos
+    elif [[ "$PLATFORM" == "linux" ]]; then
+        uninstall_service_linux
+    fi
 }
 
 cmd_service_status() {
@@ -1087,18 +1177,37 @@ cmd_service_status() {
         printf "Daemon: ${C_RED}STOPPED${C_RST}\n"
     fi
 
-    if [[ -f "$LAUNCH_AGENT_PATH" ]]; then
-        printf "LaunchAgent: ${C_GREEN}installed${C_RST}\n"
-    else
-        printf "LaunchAgent: ${C_YELLOW}not installed${C_RST} (run \"git local service install\")\n"
+    if [[ "$PLATFORM" == "macos" ]]; then
+        if [[ -f "$SERVICE_PATH" ]]; then
+            printf "LaunchAgent: ${C_GREEN}installed${C_RST}\n"
+        else
+            printf "LaunchAgent: ${C_YELLOW}not installed${C_RST} (run \"git local service install\")\n"
+        fi
+    elif [[ "$PLATFORM" == "linux" ]]; then
+        if systemctl --user is-enabled "$SERVICE_NAME.service" &>/dev/null; then
+            printf "systemd service: ${C_GREEN}enabled${C_RST}\n"
+        else
+            printf "systemd service: ${C_YELLOW}not enabled${C_RST} (run \"git local service install\")\n"
+        fi
     fi
 
-    if [[ -f "$LAUNCH_AGENT_PATH" ]] || global_daemon_running; then
+    local service_installed=false
+    if [[ "$PLATFORM" == "macos" && -f "$SERVICE_PATH" ]]; then
+        service_installed=true
+    elif [[ "$PLATFORM" == "linux" ]] && systemctl --user is-enabled "$SERVICE_NAME.service" &>/dev/null; then
+        service_installed=true
+    fi
+
+    if [[ "$service_installed" == "true" ]] || global_daemon_running; then
         if command -v fswatch >/dev/null 2>&1; then
             printf "Watch mode: ${C_GREEN}fswatch${C_RST} (event-driven)\n"
         else
             printf "Watch mode: ${C_YELLOW}polling${C_RST} (every 5s)\n"
-            printf "  For instant detection: ${C_BOLD}brew install fswatch${C_RST}\n"
+            if [[ "$PLATFORM" == "macos" ]]; then
+                printf "  For instant detection: ${C_BOLD}brew install fswatch${C_RST}\n"
+            elif [[ "$PLATFORM" == "linux" ]]; then
+                printf "  For instant detection: ${C_BOLD}sudo apt-get install fswatch${C_RST}\n"
+            fi
             printf "  Then reinstall the service: ${C_BOLD}git local service uninstall && git local service install${C_RST}\n"
         fi
     fi
