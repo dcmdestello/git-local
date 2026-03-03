@@ -606,17 +606,29 @@ cmd_interactive() {
             read -r filename dirname status_label <<< "${display_names[$i]}"
             IFS=' '
 
-            # Format status label with color codes
+            local sel="${selected[$i]}"
+            local hidden="${is_hidden[$i]}"
+            local changed="${is_changed[$i]}"
+
+            local effective_label="$status_label"
+            if [[ "$sel" == "x" && "$hidden" != "true" ]]; then
+                effective_label="hide"
+            elif [[ "$sel" == "x" && "$changed" == "true" ]]; then
+                effective_label="re-hide"
+            elif [[ "$sel" == " " && "$hidden" == "true" ]]; then
+                effective_label="unhide"
+            fi
+
             local status_display
-            case "$status_label" in
-                "hidden"|"hidden, untracked")
-                    status_display="${C_GREEN}($status_label)${C_RST}"
+            case "$effective_label" in
+                "hide"|"re-hide"|"hidden"|"hidden, untracked")
+                    status_display="${C_GREEN}($effective_label)${C_RST}"
                     ;;
-                "changed")
-                    status_display="${C_YELLOW}($status_label)${C_RST}"
+                "unhide"|"changed")
+                    status_display="${C_YELLOW}($effective_label)${C_RST}"
                     ;;
                 *)
-                    status_display="${C_DIM}($status_label)${C_RST}"
+                    status_display="${C_DIM}($effective_label)${C_RST}"
                     ;;
             esac
 
@@ -625,13 +637,16 @@ cmd_interactive() {
 
             # Format output with columns (aligned by max filename width)
             local fmt_width=$((max_filename_width + 2))  # Add 2 spaces for padding
+            local highlight_box="$box"
             if [[ $i -eq $current ]]; then
-                printf "%s \033[7m%b %-*s %b %b\033[0m\n" \
-                    "$cursor" "$box" "$fmt_width" "$filename" "$status_display" "$dirname_display"
-            else
-                printf "%s %b %-*s %b %b\n" \
-                    "$cursor" "$box" "$fmt_width" "$filename" "$status_display" "$dirname_display"
+                case "${selected[$i]}" in
+                    x) highlight_box="\033[7m${C_GREEN}[x]${C_RST}\033[0m" ;;
+                    -) highlight_box="\033[7m${C_YELLOW}[-]${C_RST}\033[0m" ;;
+                    *) highlight_box="\033[7m[ ]\033[0m" ;;
+                esac
             fi
+            printf "%s %b %-*s %b %b\n" \
+                "$cursor" "$highlight_box" "$fmt_width" "$filename" "$status_display" "$dirname_display"
         done
 
         # Position indicator at bottom
