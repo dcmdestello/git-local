@@ -1,6 +1,6 @@
 # git-local
 
-A macOS/Linux tool to hide local changes you don't want to commit (debug prints, config tweaks) from `git status` and `git diff` — without `.gitignore`, without stashing. This keeps your IDE's source control view clean as well.
+A macOS/Linux tool to hide local changes you don't want to commit (debug prints, config tweaks, AI-generated `.md` files) from `git status` and `git diff` — without `.gitignore`, without stashing. This keeps your IDE's source control view clean as well.
 
 Hidden files are pinned to a specific content snapshot. If a hidden file changes again, it resurfaces in `git status` automatically — so real changes are never accidentally missed.
 
@@ -30,6 +30,8 @@ Hidden files are pinned to a specific content snapshot. If a hidden file changes
 
 ## Usage
 
+Running `git local` with no arguments opens an interactive TUI where you can toggle which files to hide or unhide.
+
 ```bash
 git local                    # open interactive selector (main workflow)
 ```
@@ -38,11 +40,9 @@ git local                    # open interactive selector (main workflow)
 git local help               # see all commands
 ```
 
-Running `git local` with no arguments opens an interactive TUI where you can toggle which files to hide or unhide.
-
 ### Typical workflow
 
-1. You add debug code (e.g. `console.log`) or tweak a local config.
+1. You add debug code (e.g. `console.log`) or tweak a local config that you want to keep long-term without polluting `git status`.
 2. Run `git local` and select those files — they disappear from `git status`.
 3. Keep working. If you make a *real* change to a hidden file, it automatically reappears so you don't miss it.
 
