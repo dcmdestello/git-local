@@ -906,20 +906,15 @@ cmd_status() {
 
     [[ -f "$HIDDEN_FILE" && -s "$HIDDEN_FILE" ]] || { echo "no files hidden"; return 0; }
 
-    # Calculate max filename width for alignment
-    local max_filename_width=0
-    while IFS=' ' read -r stored_hash path || [[ -n "$stored_hash" ]]; do
-        [[ -z "$stored_hash" ]] && continue
-        local rel_path
-        rel_path=$(cwd_relative "$path")
-        local filename="${rel_path##*/}"
-        [[ ${#filename} -gt $max_filename_width ]] && max_filename_width=${#filename}
-    done < "$HIDDEN_FILE"
+    # Header with consistent column widths
+    printf "${C_BOLD}%-30s %-20s %-10s %s${C_RST}\n" "FILE" "STATE" "HASH" "PATH"
 
-    local filename_col_width=$((max_filename_width + 2))
-
-    printf "${C_BOLD}%-*s %-18s %-8s %s${C_RST}\n" "$filename_col_width" "FILE" "STATE" "HASH" "PATH"
-    printf "${C_DIM}%-*s %-18s %-8s %s${C_RST}\n" "$filename_col_width" "$(printf '%.0s─' $(seq 1 $max_filename_width))" "──────────────────" "────────" "────"
+    # Separator with matching widths
+    printf "${C_DIM}%-30s %-20s %-10s %s${C_RST}\n" \
+        "$(printf '%.0s─' $(seq 1 30))" \
+        "$(printf '%.0s─' $(seq 1 20))" \
+        "$(printf '%.0s─' $(seq 1 10))" \
+        "$(printf '%.0s─' $(seq 1 80))"
 
     while IFS=' ' read -r stored_hash path || [[ -n "$stored_hash" ]]; do
         [[ -z "$stored_hash" ]] && continue
@@ -957,7 +952,7 @@ cmd_status() {
         # Format directory path with cyan color
         local dirname_display="${C_CYAN}$dirname${C_RST}"
 
-        printf "%-*s ${state_color}%-18s${C_RST} %-8s %b\n" "$filename_col_width" "$filename" "$state" "$hash_display" "$dirname_display"
+        printf "%-30s ${state_color}%-20s${C_RST} %-10s %b\n" "$filename" "$state" "$hash_display" "$dirname_display"
     done < "$HIDDEN_FILE"
 }
 
@@ -1286,7 +1281,7 @@ cmd_disable() {
         else
             git -C "$REPO_ROOT" update-index --no-skip-worktree -- "$path" 2>/dev/null || true
         fi
-        ((count++))
+        ((count++)) || true
     done < "$HIDDEN_FILE"
 
     # Create disabled flag
@@ -1322,7 +1317,7 @@ cmd_enable() {
         else
             git -C "$REPO_ROOT" update-index --skip-worktree -- "$path" 2>/dev/null || true
         fi
-        ((count++))
+        ((count++)) || true
     done < "$HIDDEN_FILE"
 
     # Remove disabled flag
