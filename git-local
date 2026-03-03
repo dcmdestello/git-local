@@ -888,7 +888,11 @@ cmd_status() {
     init
 
     if global_daemon_running; then
-        printf "Daemon: ${C_GREEN}RUNNING${C_RST} (PID %s)\n" "$(cat "$GLOBAL_PID")"
+        if command -v fswatch >/dev/null 2>&1; then
+            printf "Daemon: ${C_GREEN}RUNNING${C_RST} (PID %s, fswatch)\n" "$(cat "$GLOBAL_PID")"
+        else
+            printf "Daemon: ${C_GREEN}RUNNING${C_RST} (PID %s, polling)\n" "$(cat "$GLOBAL_PID")"
+        fi
     else
         printf "Daemon: ${C_RED}STOPPED${C_RST}\n"
         if [[ -f "$HIDDEN_FILE" && -s "$HIDDEN_FILE" ]]; then
@@ -1038,6 +1042,19 @@ cmd_daemon() {
     fi
 }
 
+print_fswatch_hint() {
+    if ! command -v fswatch >/dev/null 2>&1; then
+        printf '\n'
+        printf "${C_YELLOW}Note:${C_RST} fswatch not found — daemon will use polling (every 5s).\n"
+        if [[ "$PLATFORM" == "macos" ]]; then
+            printf "  For instant detection: ${C_BOLD}brew install fswatch${C_RST}\n"
+        elif [[ "$PLATFORM" == "linux" ]]; then
+            printf "  For instant detection: ${C_BOLD}sudo apt-get install fswatch${C_RST}\n"
+        fi
+        printf "  Then reinstall the service: ${C_BOLD}git local service uninstall && git local service install${C_RST}\n"
+    fi
+}
+
 install_service_macos() {
     local script_path="$1"
     mkdir -p "$(dirname "$SERVICE_PATH")"
@@ -1076,6 +1093,7 @@ PLIST
     printf "${C_GREEN}Installed LaunchAgent service.${C_RST}\n"
     printf 'LaunchAgent: %s\n' "$SERVICE_PATH"
     printf 'Logs: %s\n' "$GLOBAL_LOG"
+    print_fswatch_hint
 }
 
 install_service_linux() {
@@ -1114,6 +1132,7 @@ SYSTEMD
     printf '\nManage with:\n'
     printf '  systemctl --user status git-local\n'
     printf '  systemctl --user restart git-local\n'
+    print_fswatch_hint
 }
 
 cmd_install_service() {
@@ -1198,12 +1217,7 @@ cmd_service_status() {
             printf "Watch mode: ${C_GREEN}fswatch${C_RST} (event-driven)\n"
         else
             printf "Watch mode: ${C_YELLOW}polling${C_RST} (every 5s)\n"
-            if [[ "$PLATFORM" == "macos" ]]; then
-                printf "  For instant detection: ${C_BOLD}brew install fswatch${C_RST}\n"
-            elif [[ "$PLATFORM" == "linux" ]]; then
-                printf "  For instant detection: ${C_BOLD}sudo apt-get install fswatch${C_RST}\n"
-            fi
-            printf "  Then reinstall the service: ${C_BOLD}git local service uninstall && git local service install${C_RST}\n"
+            print_fswatch_hint
         fi
     fi
     printf 'Logs: %s\n' "$GLOBAL_LOG"
