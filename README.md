@@ -1,106 +1,76 @@
 # git-local
 
-A lightweight tool to keep local debug changes (print statements, config tweaks) out of your git status/diffs, while still allowing you to modify those files.
+A macOS/Linux tool to hide local changes you don't want to commit (debug prints, config tweaks) from `git status` and `git diff` — without `.gitignore`, without stashing. This keeps your IDE's source control view clean as well.
 
-It uses `git update-index --skip-worktree` combined with a content-hash check to conditionally hide files **only when they match a specific "debug" state**. If you make further changes, they automatically reappear in `git status`.
+It uses `git update-index --skip-worktree` combined with a content-hash check to conditionally hide files only when they match a specific state. If you make further changes, they automatically reappear in `git status`.
 
 ## Installation
 
-1.  Clone this repo:
-    ```bash
-    git clone https://github.com/yourname/git-local.git
-    cd git-local
-    ```
+1. Place the `git-local` script somewhere on your `PATH` (e.g. `~/bin/git-local`):
+   ```bash
+   cp git-local ~/bin/
+   chmod +x ~/bin/git-local
+   ```
 
-2.  Run the deploy script (installs to `~/bin/git-local`):
-    ```bash
-    ./deploy.sh
-    ```
+2. Git automatically discovers it as a subcommand — use `git local <command>`.
 
-3.  (Highly Recommended) Install `fswatch` for instant background updates:
-    ```bash
-    brew install fswatch
-    ```
-    *Without fswatch, the background watcher falls back to polling every 3 seconds.*
+3. (Recommended) Install `fswatch` for instant file-change detection:
+   ```bash
+   # macOS
+   brew install fswatch
+   # Linux
+   sudo apt-get install fswatch
+   ```
+   Without `fswatch`, the daemon polls every 5 seconds.
+
+4. Install the background daemon so hidden files stay in sync automatically:
+   ```bash
+   git local service install
+   ```
 
 ## Usage
 
-### 1. Mark files to hide
-Add your debug code (e.g. `print("DEBUG")`), then run:
+```bash
+git local                    # open interactive selector (main workflow)
+```
 
 ```bash
-git local mark file.py       # Mark specific file
-git local mark .             # Mark all modified files in current dir
-git local mark               # Open interactive selection menu
+git local help               # see all commands
 ```
 
-These files will vanish from `git status` and `git diff`.
-**This automatically starts a background watcher for this repo.**
+Running `git local` with no arguments opens an interactive TUI where you can toggle which files to hide or unhide.
 
-### 2. Working with marked files
-- **No changes:** File remains hidden.
-- **You make a REAL change:** The watcher detects the file change -> verifies hash -> reveals file in `git status`.
-- **You undo the real change:** The watcher detects change -> verifies hash -> hides file again.
+### Typical workflow
 
-### 3. Unmarking
-To stop hiding a file and commit it (or just clean up):
+1. You add debug code (e.g. `console.log`) or tweak a local config.
+2. Run `git local` and select those files — they disappear from `git status`.
+3. Keep working. If you make a *real* change to a hidden file, it automatically reappears so you don't miss it.
+
+### Other commands
+
+You won't need `hide`, `show`, or `status` directly — interactive mode covers them. Two commands worth knowing:
+
+- **`git local rehide`** — Re-snapshots and hides all changed files at once. You can also do this from interactive mode.
+- **`git local reset`** — Unhides everything and clears all state. A clean slate.
+
+### Disable/enable for branch switching, merging, and rebasing
+
+Git operations like `checkout`, `pull`, `merge`, and `rebase` can fail if a hidden file has conflicts. Stashing won't help since skip-worktree files are invisible to `git stash`. If you hit a conflict, temporarily reveal everything:
 
 ```bash
-git local unmark file.py
-git local unmark .           # Unmark all in current dir
+git local disable            # unhide all files, keep the list
+git stash                    # stash the now-visible changes
+git checkout other-branch    # or pull, merge, rebase, etc.
+git stash pop
+git local enable             # re-hide everything from the list
 ```
 
-**If you unmark the last file, the background watcher stops automatically.**
+`disable` preserves your hidden-files list so `enable` can restore it exactly.
 
-### 4. Status
-Check what's currently hidden and if the watcher is running:
+## How it works
 
-```bash
-git local status   # or 'git local ls'
-```
-Example output:
-```
-Watcher: RUNNING (PID 12345)
+- **Tracked files:** Uses `git update-index --skip-worktree` to hide changes, paired with a content hash to detect when the file diverges from the hidden snapshot.
+- **Untracked files:** Adds entries to `.git/info/exclude` (a local-only gitignore).
+- **Background daemon:** Watches hidden files and automatically reveals them when their contents change. Supports `fswatch` (event-driven) or falls back to polling.
 
-FILE          STATE     HASH
-----          -----     ----
-utils.py      hidden    a1b2c3d4
-```
-
-### 5. Managing the Watcher
-The watcher runs in the background (daemonized) per repository.
-
-- **Auto-Start:** Happens automatically when you `mark` files.
-- **Auto-Stop:** Happens automatically when you `unmark` all files.
-- **Manual Control:**
-  ```bash
-  git local watch   # Start watcher manually (if stopped)
-  git local stop    # Stop watcher manually
-  ```
-
-**Important:** If you reboot your computer, the background watcher will die. Run `git local status` to check, and `git local watch` to restart it.
-
-## Commands Reference
-
-| Command | Description |
-|---|---|
-| `mark [files...]` | Snapshot content, hide from git, and **start watcher**. No args = interactive. |
-| `unmark [files...]` | Unhide, stop tracking, and **stop watcher** if empty. |
-| `ls` / `status` | Show marked files and watcher status. |
-| `watch` | Manually start the background watcher. |
-| `stop` | Manually stop the background watcher. |
-| `sync` | One-off check (useful if you don't want the watcher running). |
-
-## FAQ
-
-**Q: What if I switch branches?**
-A: **Dangerous.** `git checkout` can get confused by hidden files. Recommended workflow:
-1. `git local unmark .` (or stash changes)
-2. `git checkout other-branch`
-3. Re-apply debug changes & `git local mark .`
-
-**Q: Does this modify `.gitignore`?**
-A: No. It uses `.git/local-marks` to track state and `git update-index` to hide files. It is purely local to your repo.
-
-**Q: Why do I need fswatch?**
-A: Without it, the background process has to wake up every 3 seconds to check file hashes. With `fswatch`, it sleeps until a file actually changes, which is better for battery and performance.
+All state is local to your machine — primarily stored in `.git/local-hidden`.
