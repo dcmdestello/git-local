@@ -2,7 +2,7 @@
 
 A macOS/Linux tool to hide local changes you don't want to commit (debug prints, config tweaks) from `git status` and `git diff` — without `.gitignore`, without stashing. This keeps your IDE's source control view clean as well.
 
-It uses `git update-index --skip-worktree` combined with a content-hash check to conditionally hide files only when they match a specific state. If you make further changes, they automatically reappear in `git status`.
+Hidden files are pinned to a specific content snapshot. If a hidden file changes again, it resurfaces in `git status` automatically — so real changes are never accidentally missed.
 
 ## Installation
 
@@ -21,7 +21,7 @@ It uses `git update-index --skip-worktree` combined with a content-hash check to
    # Linux
    sudo apt-get install fswatch
    ```
-   Without `fswatch`, the daemon polls every 5 seconds.
+   Without `fswatch`, the daemon falls back to polling every 5 seconds.
 
 4. Install the background daemon so hidden files stay in sync automatically:
    ```bash
