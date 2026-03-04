@@ -53,7 +53,7 @@ You won't need `hide`, `show`, or `status` directly — interactive mode covers 
 - **`git local rehide`** — Re-snapshots and hides all changed files at once. You can also do this from interactive mode.
 - **`git local reset`** — Unhides everything and clears all state. A clean slate.
 
-### Disable/enable for branch switching, merging, and rebasing
+### The downside: Might need to disable on conflict when branch switching, merging...
 
 Git operations like `checkout`, `pull`, `merge`, and `rebase` can fail if a hidden file has conflicts. Stashing won't help since skip-worktree files are invisible to `git stash`. If you hit a conflict, temporarily reveal everything:
 
@@ -65,7 +65,7 @@ git stash pop
 git local enable             # re-hide everything from the list
 ```
 
-`disable` preserves your hidden-files list so `enable` can restore it exactly.
+`disable` preserves your hidden-files list so `enable` can restore it exactly. In general, if your hidden files are not touched by the other branch/code you don't need to do anything.
 
 ## How it works
 
