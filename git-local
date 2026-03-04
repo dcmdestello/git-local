@@ -562,13 +562,13 @@ cmd_interactive() {
         [[ $scroll_offset -lt 0 ]] && scroll_offset=0
         [[ $scroll_offset -gt $max_scroll ]] && scroll_offset=$max_scroll
 
-        printf '\033[2J\033[H'
+        printf '\033[H'
 
-        printf "${C_BOLD}Select files to hide:${C_RST}\n"
-        printf "  ${C_DIM}[Space] toggle  [Enter] confirm  [q] cancel${C_RST}\n"
-        printf "  ${C_DIM}[w/↑/s/↓/j/k] move  [a] all  [d] none${C_RST}\n"
-        [[ ${#g_changed[@]} -gt 0 ]] && printf "  ${C_DIM}[r] re-hide  [g/G] first/last  [Pg↓/↑] page${C_RST}\n"
-        echo ""
+        printf "${C_BOLD}Select files to hide:${C_RST}\033[K\n"
+        printf "  ${C_DIM}[Space] toggle  [Enter] confirm  [q] cancel${C_RST}\033[K\n"
+        printf "  ${C_DIM}[w/↑/s/↓/j/k] move  [a] all  [d] none${C_RST}\033[K\n"
+        [[ ${#g_changed[@]} -gt 0 ]] && printf "  ${C_DIM}[r] re-hide  [g/G] first/last  [Pg↓/↑] page${C_RST}\033[K\n" || printf "\033[K\n"
+        printf "\033[K\n"
 
         # Calculate max filename width for alignment
         local max_filename_width=0
@@ -587,7 +587,7 @@ cmd_interactive() {
         for ((i=visible_start; i<visible_end; i++)); do
             # Sentinel: blank separator line
             if [[ -z "${candidates[$i]}" ]]; then
-                echo ""
+                printf "\033[K\n"
                 continue
             fi
 
@@ -645,20 +645,23 @@ cmd_interactive() {
                     *) highlight_box="\033[7m[ ]\033[0m" ;;
                 esac
             fi
-            printf "%s %b %-*s %b %b\n" \
+            printf "%s %b %-*s %b %b\033[K\n" \
                 "$cursor" "$highlight_box" "$fmt_width" "$filename" "$status_display" "$dirname_display"
         done
 
         # Position indicator at bottom
-        echo ""
+        printf "\033[K\n"
         if [[ $total -gt $viewport_height ]]; then
-            printf "${C_DIM}(%d-%d)/%d items${C_RST}\n" \
+            printf "${C_DIM}(%d-%d)/%d items${C_RST}\033[K\n" \
                 $((visible_start + 1)) \
                 $((visible_end)) \
                 $total
         else
-            printf "${C_DIM}%d items${C_RST}\n" $total
+            printf "${C_DIM}%d items${C_RST}\033[K\n" $total
         fi
+
+        # Erase any leftover lines from previous renders
+        printf '\033[J'
 
         local key
         IFS= read -rsn1 key
