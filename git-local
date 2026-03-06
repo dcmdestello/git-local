@@ -60,7 +60,11 @@ init_for_repo() {
 # Resolve a path (relative to cwd or absolute) to repo-root-relative
 repo_relative() {
     local abs
-    abs="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+    if [[ -d "$1" ]]; then
+        abs="$(cd "$1" && pwd)"
+    else
+        abs="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+    fi
     printf '%s' "${abs#"$REPO_ROOT"/}"
 }
 
@@ -118,11 +122,13 @@ _excl_write() {
     local exclude="$GIT_DIR/info/exclude"
     mkdir -p "$GIT_DIR/info"
     local tmp="$exclude.tmp"
+    local line
     for line in ${_EXCL_OTHER[@]+"${_EXCL_OTHER[@]}"}; do
         printf '%s\n' "$line"
     done > "$tmp"
     if [[ ${#_EXCL_ENTRIES[@]} -gt 0 ]]; then
         printf '%s\n' "$_EXCL_BEGIN" >> "$tmp"
+        local entry
         for entry in "${_EXCL_ENTRIES[@]}"; do
             printf '%s\n' "$entry"
         done >> "$tmp"
@@ -544,10 +550,19 @@ cmd_interactive() {
         done
     }
 
-    # ── TUI Loop ──
+    # ── TUI Setup ──
     printf '\033[?25l'
     trap "printf '\033[?25h'" EXIT
 
+    # Render static header once
+    printf '\033[H'
+    printf "${C_BOLD}Select files to hide:${C_RST}\033[K\n"
+    printf "  ${C_DIM}[Space] toggle  [Enter] confirm  [q] cancel${C_RST}\033[K\n"
+    printf "  ${C_DIM}[w/↑/s/↓/j/k] move  [a] all  [d] none${C_RST}\033[K\n"
+    [[ ${#g_changed[@]} -gt 0 ]] && printf "  ${C_DIM}[r] re-hide  [g/G] first/last  [Pg↓/↑] page${C_RST}\033[K\n" || printf "\033[K\n"
+    local header_lines=5
+
+    # ── TUI Loop ──
     while true; do
         # Auto-scroll to keep cursor in view
         local first_visible=$scroll_offset
@@ -562,13 +577,8 @@ cmd_interactive() {
         [[ $scroll_offset -lt 0 ]] && scroll_offset=0
         [[ $scroll_offset -gt $max_scroll ]] && scroll_offset=$max_scroll
 
-        printf '\033[H'
-
-        printf "${C_BOLD}Select files to hide:${C_RST}\033[K\n"
-        printf "  ${C_DIM}[Space] toggle  [Enter] confirm  [q] cancel${C_RST}\033[K\n"
-        printf "  ${C_DIM}[w/↑/s/↓/j/k] move  [a] all  [d] none${C_RST}\033[K\n"
-        [[ ${#g_changed[@]} -gt 0 ]] && printf "  ${C_DIM}[r] re-hide  [g/G] first/last  [Pg↓/↑] page${C_RST}\033[K\n" || printf "\033[K\n"
-        printf "\033[K\n"
+        # Move cursor to start of list area (below header)
+        printf "\033[${header_lines}H"
 
         # Calculate max filename width for alignment
         local max_filename_width=0
