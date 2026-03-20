@@ -162,18 +162,59 @@ exclude_remove() {
     _excl_write
 }
 
+# Batch add multiple paths to exclude file (one read+write for all)
+exclude_add_multi() {
+    [[ $# -eq 0 ]] && return 0
+    _excl_read
+    for path in "$@"; do
+        local already=false
+        for e in ${_EXCL_ENTRIES[@]+"${_EXCL_ENTRIES[@]}"}; do
+            [[ "$e" == "$path" ]] && { already=true; break; }
+        done
+        $already || _EXCL_ENTRIES+=("$path")
+    done
+    _excl_write
+}
+
+# Batch remove multiple paths from exclude file (one read+write for all)
+exclude_remove_multi() {
+    [[ $# -eq 0 ]] && return 0
+    _excl_read
+    local new_entries=()
+    for e in ${_EXCL_ENTRIES[@]+"${_EXCL_ENTRIES[@]}"}; do
+        local keep=true
+        for path in "$@"; do
+            [[ "$e" == "$path" ]] && { keep=false; break; }
+        done
+        $keep && new_entries+=("$e")
+    done
+    _EXCL_ENTRIES=("${new_entries[@]+"${new_entries[@]}"}")
+    _excl_write
+}
+
 # ── hidden helpers ────────────────────────────────────────────────────────────
 
-# Remove a path's entry from the hidden file
-drop_entry() {
-    local target="$1"
+# Batch remove multiple paths from hidden file (one read+write for all)
+drop_entries_batch() {
+    [[ $# -eq 0 ]] && return 0
     [[ -f "$HIDDEN_FILE" ]] || return 0
+    local targets=("$@")
     local tmp="$HIDDEN_FILE.tmp"
     while IFS= read -r line || [[ -n "$line" ]]; do
         [[ -z "$line" ]] && continue
-        [[ "${line#* }" != "$target" ]] && printf '%s\n' "$line"
+        local path="${line#* }"
+        local should_drop=false
+        for t in "${targets[@]}"; do
+            [[ "$path" == "$t" ]] && { should_drop=true; break; }
+        done
+        $should_drop || printf '%s\n' "$line"
     done < "$HIDDEN_FILE" > "$tmp"
     mv "$tmp" "$HIDDEN_FILE"
+}
+
+# Remove a single path's entry from the hidden file (thin wrapper for compatibility)
+drop_entry() {
+    drop_entries_batch "$1"
 }
 
 
@@ -261,23 +302,34 @@ cmd_hide() {
         return 0
     fi
 
+    # Batch drop all entries being re-hidden
+    local all_to_drop=()
+    all_to_drop+=("${files[@]+"${files[@]}"}")
+    all_to_drop+=("${untracked[@]+"${untracked[@]}"}")
+    drop_entries_batch "${all_to_drop[@]}"
+
+    # Collect new entries to append
+    local new_entries=()
+
     for rel in ${files[@]+"${files[@]}"}; do
         local hash
         hash=$(git hash-object "$REPO_ROOT/$rel")
-
-        drop_entry "$rel"
-        printf '%s %s\n' "$hash" "$rel" >> "$HIDDEN_FILE"
+        new_entries+=("$hash $rel")
         git -C "$REPO_ROOT" update-index --skip-worktree -- "$rel"
-
         printf "${C_GREEN}hidden:${C_RST} %s ${C_DIM}(%s)${C_RST}\n" "$(cwd_relative "$rel")" "${hash:0:8}"
     done
 
-    for rel in ${untracked[@]+"${untracked[@]}"}; do
-        exclude_add "$rel"
-        drop_entry "$rel"
-        printf '%s %s\n' "untracked" "$rel" >> "$HIDDEN_FILE"
+    # Batch add all untracked paths to exclude
+    exclude_add_multi "${untracked[@]+"${untracked[@]}"}"
 
+    for rel in ${untracked[@]+"${untracked[@]}"}; do
+        new_entries+=("untracked $rel")
         printf "${C_GREEN}hidden:${C_RST} %s ${C_DIM}(untracked)${C_RST}\n" "$(cwd_relative "$rel")"
+    done
+
+    # Append all new entries to HIDDEN_FILE at once
+    for entry in "${new_entries[@]}"; do
+        printf '%s\n' "$entry" >> "$HIDDEN_FILE"
     done
 
     notify_watcher
@@ -295,6 +347,7 @@ cmd_rehide() {
     [[ -f "$HIDDEN_FILE" && -s "$HIDDEN_FILE" ]] || { echo "no files hidden"; return 0; }
 
     local new_entries=() rehidden=0 unchanged=0
+    local deleted_untracked=()
 
     while IFS=' ' read -r stored_hash path || [[ -n "$stored_hash" ]]; do
         [[ -z "$stored_hash" || -z "$path" ]] && continue
@@ -305,7 +358,7 @@ cmd_rehide() {
                 new_entries+=("untracked $path")
                 ((unchanged++)) || true
             else
-                exclude_remove "$path"
+                deleted_untracked+=("$path")
                 printf "${C_DIM}removed: %s (deleted)${C_RST}\n" "$(cwd_relative "$path")"
             fi
             continue
@@ -329,6 +382,9 @@ cmd_rehide() {
             ((unchanged++)) || true
         fi
     done < "$HIDDEN_FILE"
+
+    # Batch remove deleted untracked files from exclude
+    exclude_remove_multi "${deleted_untracked[@]+"${deleted_untracked[@]}"}"
 
     # Rewrite hidden file
     local tmp="$HIDDEN_FILE.tmp"
@@ -388,6 +444,8 @@ cmd_interactive() {
     local g_changed=() g_modified=() g_untracked=() g_hidden_tracked=() g_hidden_untracked=()
 
     # ── Collect hidden files (split into changed or hidden) ──
+    local deleted_tracked=()
+    local deleted_untracked=()
     if [[ -f "$HIDDEN_FILE" ]]; then
         while IFS=' ' read -r stored_hash path || [[ -n "$stored_hash" ]]; do
             [[ -z "$stored_hash" || -z "$path" ]] && continue
@@ -404,16 +462,15 @@ cmd_interactive() {
                     [[ "$dirname" == "$rel_path" ]] && dirname="."
                     g_hidden_untracked+=("$path|true|false|true|$filename|$dirname|hidden, untracked|x")
                 else
-                    # File deleted, auto-clean
-                    drop_entry "$path"
-                    exclude_remove "$path"
+                    # File deleted, auto-clean — collect for batch removal
+                    deleted_untracked+=("$path")
                 fi
                 continue
             fi
 
             # Auto-clean deleted tracked files
             if [[ ! -f "$REPO_ROOT/$path" ]]; then
-                drop_entry "$path"
+                deleted_tracked+=("$path")
                 git -C "$REPO_ROOT" update-index --no-skip-worktree -- "$path" 2>/dev/null || true
                 continue
             fi
@@ -432,6 +489,13 @@ cmd_interactive() {
                 g_changed+=("$path|true|true|false|$filename|$dirname|changed|-")
             fi
         done < "$HIDDEN_FILE"
+
+        # Batch clean up deleted files after collection loop
+        local all_deleted=()
+        all_deleted+=("${deleted_tracked[@]+"${deleted_tracked[@]}"}")
+        all_deleted+=("${deleted_untracked[@]+"${deleted_untracked[@]}"}")
+        drop_entries_batch "${all_deleted[@]+"${all_deleted[@]}"}"
+        exclude_remove_multi "${deleted_untracked[@]+"${deleted_untracked[@]}"}"
     fi
 
     # ── Collect modified files ──
@@ -554,14 +618,6 @@ cmd_interactive() {
     printf '\033[?25l'
     trap "printf '\033[?25h'" EXIT
 
-    # Render static header once
-    printf '\033[H'
-    printf "${C_BOLD}Select files to hide:${C_RST}\033[K\n"
-    printf "  ${C_DIM}[Space] toggle  [Enter] confirm  [q] cancel${C_RST}\033[K\n"
-    printf "  ${C_DIM}[w/↑/s/↓/j/k] move  [a] all  [d] none${C_RST}\033[K\n"
-    [[ ${#g_changed[@]} -gt 0 ]] && printf "  ${C_DIM}[r] re-hide  [g/G] first/last  [Pg↓/↑] page${C_RST}\033[K\n" || printf "\033[K\n"
-    local header_lines=5
-
     # ── TUI Loop ──
     while true; do
         # Auto-scroll to keep cursor in view
@@ -577,8 +633,14 @@ cmd_interactive() {
         [[ $scroll_offset -lt 0 ]] && scroll_offset=0
         [[ $scroll_offset -gt $max_scroll ]] && scroll_offset=$max_scroll
 
-        # Move cursor to start of list area (below header)
-        printf "\033[${header_lines}H"
+        # Move to top and render (no full clear, just move and overwrite)
+        printf '\033[H'
+
+        printf "${C_BOLD}Select files to hide:${C_RST}\033[K\n"
+        printf "  ${C_DIM}[Space] toggle  [Enter] confirm  [q] cancel${C_RST}\033[K\n"
+        printf "  ${C_DIM}[w/↑/s/↓/j/k] move  [a] all  [d] none${C_RST}\033[K\n"
+        [[ ${#g_changed[@]} -gt 0 ]] && printf "  ${C_DIM}[r] re-hide  [g/G] first/last  [Pg↓/↑] page${C_RST}\033[K\n" || printf "\033[K\n"
+        printf "\033[K\n"
 
         # Calculate max filename width for alignment
         local max_filename_width=0
@@ -724,6 +786,12 @@ cmd_interactive() {
     # ── Apply changes ──
     printf '\n'
 
+    # Collect all modifications before applying them in batch
+    local new_entries=()
+    local to_drop=()
+    local to_add_excl=()
+    local to_remove_excl=()
+
     for ((i=0; i<total; i++)); do
         local path="${candidates[$i]}"
         [[ -z "$path" ]] && continue  # skip sentinels
@@ -738,36 +806,45 @@ cmd_interactive() {
 
         if [[ "$sel" == "x" ]] && [[ "$was_hidden" != "true" ]]; then
             # New hide
+            to_drop+=("$path")
             if [[ "$untracked" == "true" ]]; then
-                exclude_add "$path"
-                drop_entry "$path"
-                printf '%s %s\n' "untracked" "$path" >> "$HIDDEN_FILE"
+                to_add_excl+=("$path")
+                new_entries+=("untracked $path")
             else
                 local hash
                 hash=$(git hash-object "$REPO_ROOT/$path")
-                drop_entry "$path"
-                printf '%s %s\n' "$hash" "$path" >> "$HIDDEN_FILE"
+                new_entries+=("$hash $path")
                 git -C "$REPO_ROOT" update-index --skip-worktree -- "$path"
             fi
             printf "${C_GREEN}hidden:${C_RST} %s\n" "$(cwd_relative "$path")"
         elif [[ "$sel" == "x" ]] && [[ "$was_hidden" == "true" ]] && [[ "$changed" == "true" ]]; then
             # Re-hide with updated hash
+            to_drop+=("$path")
             local hash
             hash=$(git hash-object "$REPO_ROOT/$path")
-            drop_entry "$path"
-            printf '%s %s\n' "$hash" "$path" >> "$HIDDEN_FILE"
+            new_entries+=("$hash $path")
             git -C "$REPO_ROOT" update-index --skip-worktree -- "$path" 2>/dev/null || true
             printf "${C_CYAN}re-hidden:${C_RST} %s\n" "$(cwd_relative "$path")"
         elif [[ "$sel" == " " ]] && [[ "$was_hidden" == "true" ]]; then
             # Unhide
-            drop_entry "$path"
+            to_drop+=("$path")
             if [[ "$untracked" == "true" ]]; then
-                exclude_remove "$path"
+                to_remove_excl+=("$path")
             else
                 git -C "$REPO_ROOT" update-index --no-skip-worktree -- "$path" 2>/dev/null || true
             fi
             printf "${C_YELLOW}unhidden:${C_RST} %s\n" "$(cwd_relative "$path")"
         fi
+    done
+
+    # Apply all batched modifications
+    drop_entries_batch "${to_drop[@]+"${to_drop[@]}"}"
+    exclude_add_multi "${to_add_excl[@]+"${to_add_excl[@]}"}"
+    exclude_remove_multi "${to_remove_excl[@]+"${to_remove_excl[@]}"}"
+
+    # Append all new entries to HIDDEN_FILE
+    for entry in "${new_entries[@]}"; do
+        printf '%s\n' "$entry" >> "$HIDDEN_FILE"
     done
 }
 
@@ -797,13 +874,15 @@ cmd_show() {
     done < "$HIDDEN_FILE"
 
     local found_any=false
+    local to_drop=()
+    local to_remove_excl=()
 
     # Unhide tracked files via git ls-files pathspec matching
     if [[ ${#tracked_hidden[@]} -gt 0 ]]; then
         while IFS= read -r -d '' cand; do
             for entry in "${tracked_hidden[@]}"; do
                 if [[ "$cand" == "$entry" ]]; then
-                    drop_entry "$entry"
+                    to_drop+=("$entry")
                     git -C "$REPO_ROOT" update-index --no-skip-worktree -- "$entry" 2>/dev/null || true
                     printf "${C_YELLOW}unhidden:${C_RST} %s\n" "$(cwd_relative "$entry")"
                     found_any=true
@@ -820,14 +899,18 @@ cmd_show() {
             rel_arg=$(repo_relative "$arg")
             # Match: exact path, "." (all), or directory prefix
             if [[ "$entry" == "$rel_arg" || "$rel_arg" == "." || "$entry" == "$rel_arg"/* ]]; then
-                drop_entry "$entry"
-                exclude_remove "$entry"
+                to_drop+=("$entry")
+                to_remove_excl+=("$entry")
                 printf "${C_YELLOW}unhidden:${C_RST} %s\n" "$(cwd_relative "$entry")"
                 found_any=true
                 break
             fi
         done
     done
+
+    # Batch drop and exclude remove operations
+    drop_entries_batch "${to_drop[@]+"${to_drop[@]}"}"
+    exclude_remove_multi "${to_remove_excl[@]+"${to_remove_excl[@]}"}"
 
     if ! $found_any; then
          printf 'no hidden files matched arguments\n'
@@ -844,6 +927,7 @@ do_sync() {
     [[ -f "$HIDDEN_FILE" && -s "$HIDDEN_FILE" ]] || return 0
 
     local hashes=() paths=() dirty=false
+    local deleted_untracked=()
 
     while IFS=' ' read -r h p || [[ -n "$h" ]]; do
         [[ -z "$h" ]] && continue
@@ -859,7 +943,7 @@ do_sync() {
         # Untracked files: only need to clean up if deleted
         if [[ "$stored" == "untracked" ]]; then
             if [[ ! -f "$full" ]]; then
-                exclude_remove "$p"
+                deleted_untracked+=("$p")
                 hashes[$i]=""
                 paths[$i]=""
                 dirty=true
@@ -895,6 +979,9 @@ do_sync() {
             fi
         fi
     done
+
+    # Batch remove deleted untracked files from exclude
+    exclude_remove_multi "${deleted_untracked[@]+"${deleted_untracked[@]}"}"
 
     if $dirty; then
         local tmp="$HIDDEN_FILE.tmp"
@@ -1282,15 +1369,19 @@ cmd_reset() {
     [[ -f "$HIDDEN_FILE" && -s "$HIDDEN_FILE" ]] \
         || { echo "no files currently hidden"; return 0; }
 
+    local untracked_to_remove=()
     while IFS=' ' read -r hash path || [[ -n "$hash" ]]; do
         [[ -z "$hash" || -z "$path" ]] && continue
         if [[ "$hash" == "untracked" ]]; then
-            exclude_remove "$path"
+            untracked_to_remove+=("$path")
         else
             git -C "$REPO_ROOT" update-index --no-skip-worktree -- "$path" 2>/dev/null || true
         fi
         printf "${C_YELLOW}unhidden:${C_RST} %s\n" "$(cwd_relative "$path")"
     done < "$HIDDEN_FILE"
+
+    # Batch remove all untracked from exclude
+    exclude_remove_multi "${untracked_to_remove[@]+"${untracked_to_remove[@]}"}"
 
     rm -f "$HIDDEN_FILE"
     notify_watcher
@@ -1315,16 +1406,20 @@ cmd_disable() {
 
     # Count and unhide all files (tracked and untracked)
     local count=0
+    local untracked_to_remove=()
     while IFS=' ' read -r hash path || [[ -n "$hash" ]]; do
         [[ -z "$hash" || -z "$path" ]] && continue
 
         if [[ "$hash" == "untracked" ]]; then
-            exclude_remove "$path"
+            untracked_to_remove+=("$path")
         else
             git -C "$REPO_ROOT" update-index --no-skip-worktree -- "$path" 2>/dev/null || true
         fi
         ((count++)) || true
     done < "$HIDDEN_FILE"
+
+    # Batch remove all untracked from exclude
+    exclude_remove_multi "${untracked_to_remove[@]+"${untracked_to_remove[@]}"}"
 
     # Create disabled flag
     touch "$GIT_DIR/local-disabled"
@@ -1351,16 +1446,20 @@ cmd_enable() {
 
     # Re-hide all files from registry
     local count=0
+    local untracked_to_add=()
     while IFS=' ' read -r hash path || [[ -n "$hash" ]]; do
         [[ -z "$hash" || -z "$path" ]] && continue
 
         if [[ "$hash" == "untracked" ]]; then
-            exclude_add "$path"
+            untracked_to_add+=("$path")
         else
             git -C "$REPO_ROOT" update-index --skip-worktree -- "$path" 2>/dev/null || true
         fi
         ((count++)) || true
     done < "$HIDDEN_FILE"
+
+    # Batch add all untracked to exclude
+    exclude_add_multi "${untracked_to_add[@]+"${untracked_to_add[@]}"}"
 
     # Remove disabled flag
     rm -f "$GIT_DIR/local-disabled"
