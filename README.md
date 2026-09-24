@@ -4,6 +4,8 @@ A macOS/Linux tool to hide local changes you don't want to commit (debug prints,
 
 Hidden files are pinned to a specific content snapshot. If a hidden file changes again, it resurfaces in `git status` automatically — so real changes are never accidentally missed.
 
+Once a hidden file's content matches the committed version again (you reverted it, or upstream committed the same change), `git local sync` drops it from the hidden list, since there is nothing left to hide.
+
 ## Installation
 
 1. Place the `git-local` script somewhere on your `PATH` (e.g. `~/bin/git-local`):

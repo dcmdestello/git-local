@@ -217,6 +217,11 @@ drop_entry() {
     drop_entries_batch "$1"
 }
 
+# True when a tracked file's content (given as its blob hash) equals the index
+matches_index() {
+    [[ "$2" == "$(git -C "$REPO_ROOT" ls-files -s -- "$1" | awk '{print $2}')" ]]
+}
+
 
 # ── registry ─────────────────────────────────────────────────────────────────
 
@@ -372,7 +377,10 @@ cmd_rehide() {
         local current
         current=$(git hash-object "$REPO_ROOT/$path")
 
-        if [[ "$current" != "$stored_hash" ]]; then
+        if matches_index "$path" "$current"; then
+            git -C "$REPO_ROOT" update-index --no-skip-worktree -- "$path" 2>/dev/null || true
+            printf "${C_DIM}removed: %s (no local changes)${C_RST}\n" "$(cwd_relative "$path")"
+        elif [[ "$current" != "$stored_hash" ]]; then
             new_entries+=("$current $path")
             git -C "$REPO_ROOT" update-index --skip-worktree -- "$path" 2>/dev/null || true
             printf "${C_CYAN}re-hidden:${C_RST} %s\n" "$(cwd_relative "$path")"
@@ -388,7 +396,9 @@ cmd_rehide() {
 
     # Rewrite hidden file
     local tmp="$HIDDEN_FILE.tmp"
-    printf '%s\n' ${new_entries[@]+"${new_entries[@]}"} > "$tmp"
+    for entry in ${new_entries[@]+"${new_entries[@]}"}; do
+        printf '%s\n' "$entry"
+    done > "$tmp"
     mv "$tmp" "$HIDDEN_FILE"
 
     if [[ $rehidden -eq 0 ]]; then
@@ -477,6 +487,13 @@ cmd_interactive() {
 
             local current_hash
             current_hash=$(git hash-object "$REPO_ROOT/$path")
+
+            if matches_index "$path" "$current_hash"; then
+                deleted_tracked+=("$path")
+                git -C "$REPO_ROOT" update-index --no-skip-worktree -- "$path" 2>/dev/null || true
+                continue
+            fi
+
             local rel_path
             rel_path=$(cwd_relative "$path")
             local filename="${rel_path##*/}"
@@ -925,6 +942,7 @@ cmd_show() {
 # All git commands use -C to work without requiring cwd to be in the repo.
 do_sync() {
     [[ -f "$HIDDEN_FILE" && -s "$HIDDEN_FILE" ]] || return 0
+    [[ -f "$GIT_DIR/local-disabled" ]] && return 0
 
     local hashes=() paths=() dirty=false
     local deleted_untracked=()
@@ -961,11 +979,20 @@ do_sync() {
             continue
         fi
 
-        local status_char
-        status_char=$(git -C "$REPO_ROOT" ls-files -v -- "$p" | cut -c1)
-
         local current
         current=$(git hash-object "$full")
+
+        if matches_index "$p" "$current"; then
+            git -C "$REPO_ROOT" update-index --no-skip-worktree -- "$p" 2>/dev/null || true
+            hashes[$i]=""
+            paths[$i]=""
+            dirty=true
+            printf 'removed: %s (no local changes)\n' "$p"
+            continue
+        fi
+
+        local status_char
+        status_char=$(git -C "$REPO_ROOT" ls-files -v -- "$p" | cut -c1)
 
         if [[ "$current" == "$stored" ]]; then
             if [[ "$status_char" != "S" ]]; then
@@ -1051,7 +1078,10 @@ cmd_status() {
         else
             local current
             current=$(git hash-object "$full")
-            if [[ "$current" == "$stored_hash" ]]; then
+            if matches_index "$path" "$current"; then
+                state="no local changes"
+                state_color="$C_DIM"
+            elif [[ "$current" == "$stored_hash" ]]; then
                 state="hidden"
                 state_color="$C_GREEN"
             else
@@ -1444,7 +1474,7 @@ cmd_enable() {
         return 0
     }
 
-    # Re-hide all files from registry
+    # Re-hide all files from registry whose content still matches the snapshot
     local count=0
     local untracked_to_add=()
     while IFS=' ' read -r hash path || [[ -n "$hash" ]]; do
@@ -1452,8 +1482,11 @@ cmd_enable() {
 
         if [[ "$hash" == "untracked" ]]; then
             untracked_to_add+=("$path")
-        else
+        elif [[ -f "$REPO_ROOT/$path" && "$(git hash-object "$REPO_ROOT/$path")" == "$hash" ]]; then
             git -C "$REPO_ROOT" update-index --skip-worktree -- "$path" 2>/dev/null || true
+        else
+            printf "${C_YELLOW}left visible:${C_RST} %s ${C_DIM}(content changed)${C_RST}\n" "$(cwd_relative "$path")"
+            continue
         fi
         ((count++)) || true
     done < "$HIDDEN_FILE"
@@ -1518,6 +1551,7 @@ daemon:
 When you hide a file, git-local snapshots its content. If the file
 changes, the daemon automatically reveals it to git so you don't miss
 real changes. After committing, run 'rehide' to re-hide local edits.
+Files whose content matches the index again are dropped from the list.
 USAGE
         ;;
     *)  die "unknown command: $1 (see 'git local help')" ;;
